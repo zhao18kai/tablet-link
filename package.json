@@ -1,7 +1,7 @@
 {
   "name": "tablet-link",
   "productName": "Tablet Link",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Stream a Windows display to a tablet on the local network.",
   "license": "MIT",
@@ -10,7 +10,7 @@
     "build": "node scripts/build.mjs",
     "start": "npm run build && electron .",
     "check": "tsc --noEmit",
-    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/signal.test.ts",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/*.test.ts",
     "test:e2e": "npm run build && node --test test/stream.e2e.mjs",
     "package:win": "npm run build && node scripts/package-win.mjs"
   },

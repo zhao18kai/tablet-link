@@ -7,10 +7,10 @@ if (process.platform !== 'win32') throw new Error('Run this command on a Windows
 const require = createRequire(import.meta.url)
 const executable = require('electron')
 const runtime = dirname(executable)
-const output = join('release', `Tablet-Link-win32-${process.arch}`)
+const { name, productName, version, main } = JSON.parse(await readFile('package.json', 'utf8'))
+const output = join('release', `Tablet-Link-${version}-win32-${process.arch}`)
 const defaultApp = join(runtime, 'resources', 'default_app.asar')
 const app = join(output, 'resources', 'app')
-const { name, productName, version, main } = JSON.parse(await readFile('package.json', 'utf8'))
 
 await cp(runtime, output, {
   recursive: true,

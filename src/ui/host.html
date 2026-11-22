@@ -24,6 +24,15 @@
           <h2 id="source-heading">屏幕与网络</h2>
           <button class="quiet" id="refresh" type="button">刷新设备</button>
         </header>
+        <fieldset id="modes" class="mode-options">
+          <legend>显示模式</legend>
+          <label><input type="radio" name="mode" value="screen" checked>共享现有屏幕</label>
+          <label><input type="radio" name="mode" id="mode-extension" value="extension">扩展副屏</label>
+        </fieldset>
+        <div id="display-hint" class="display-hint" hidden>
+          <p>选择 Windows 已启用的扩展屏。使用虚拟屏时，请先安装并启用虚拟显示驱动。</p>
+          <button class="quiet" id="display-settings" type="button">打开 Windows 显示设置</button>
+        </div>
         <label for="source">共享屏幕</label>
         <select id="source" disabled></select>
         <figure class="preview" aria-label="所选屏幕预览">

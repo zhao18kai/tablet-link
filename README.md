@@ -1,6 +1,6 @@
 # 平板智联
 
-Windows 11 局域网屏幕共享原型。电脑采集选中的现有屏幕，MatePad 通过浏览器接收。每次连接需要在电脑上批准，一次可连接一台平板。
+Windows 11 局域网副屏工具。电脑采集选中的 Windows 显示器，MatePad 通过浏览器接收。每次连接需要在电脑上批准，一次可连接一台平板。
 
 ## 在 MatePad 上试用
 
@@ -10,7 +10,15 @@ Windows 11 局域网屏幕共享原型。电脑采集选中的现有屏幕，Mat
 4. 用 MatePad 扫描二维码，或在平板浏览器打开桌面端显示的完整 `http://` 链接。点击 **请求观看**，再在电脑上点击 **允许连接**。
 5. 将平板横过来，点击 **全屏**。查看文字、滚动和拖动窗口时的流畅度。浏览器顶部显示实际接收尺寸和解码帧率。退出请点击电脑上的 **停止共享**。
 
-首版传输画面，采集上限为 1920 × 1250 和 30 FPS，实际值由源屏幕、网络及浏览器决定。静止画面可能只需传送少量帧。副屏扩展、声音与触控回传属于后续阶段。
+采集上限为 1920 × 1250 和 30 FPS，实际值由源屏幕、网络及浏览器决定。静止画面可能只需传送少量帧。
+
+## 使用扩展副屏
+
+1. 让 Windows 识别第二块显示器。仅使用笔记本和平板时，可先用上游 Virtual Driver Control 为 Windows 添加一块虚拟显示器。选择它的 **Virtual Display Driver**，安装需管理员权限。 [Virtual Display Driver 官方发布页](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/tag/25.7.23)
+2. 在平板智联选择 **扩展副屏**，打开 **Windows 显示设置**，选择把桌面扩展到这块显示器。Windows 也可通过 **Win + P → 扩展**切换显示模式。 [微软多显示器说明](https://support.microsoft.com/zh-cn/windows/hardware/display-graphics/how-to-use-multiple-monitors-in-windows)
+3. 在平板智联选择这块扩展屏，开始共享并配对。把 Windows 窗口拖到扩展屏，平板上会显示该窗口。
+
+平板智联会自动刷新屏幕列表。所选扩展屏断开或退出扩展模式时，共享会停止。虚拟显示器的创建和移除由安装的显示驱动管理。
 
 ### 页面打不开或连接失败
 
@@ -35,7 +43,7 @@ npm.cmd run test:e2e
 npm.cmd run package:win
 ```
 
-端到端测试使用 Windows 的实际屏幕采集和本机另一个 Edge 进程，需有桌面会话及私有 IPv4 地址。打包输出位于 `release/Tablet-Link-win32-<架构>/`。
+端到端测试使用 Windows 的实际屏幕采集和本机另一个 Edge 进程，需有桌面会话及私有 IPv4 地址。扩展屏测试还需 Windows 已启用第二块扩展显示器。打包输出位于 `release/Tablet-Link-<版本>-win32-<架构>/`。
 
 ## 许可证
 

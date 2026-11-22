@@ -1,3 +1,5 @@
+import type { DisplayRole } from './displays.ts'
+
 export type MediaSignal =
   | { type: 'offer' | 'answer'; description: RTCSessionDescriptionInit }
   | { type: 'ice'; candidate: RTCIceCandidateInit }
@@ -8,9 +10,13 @@ export type Signal = (MediaSignal | {
 
 export interface CaptureSource {
   id: string
+  displayId: string
+  role: DisplayRole
   name: string
   thumbnail: string
 }
+
+export type CaptureMode = 'screen' | 'extension'
 
 export interface NetworkAddress {
   name: string
@@ -26,8 +32,11 @@ export interface ShareInfo {
 export interface TabletLink {
   sources(): Promise<CaptureSource[]>
   networks(): Promise<NetworkAddress[]>
-  selectSource(id: string): Promise<void>
+  selectSource(id: string, displayId: string, mode: CaptureMode): Promise<void>
   start(address: string): Promise<ShareInfo>
   stop(): Promise<void>
   copy(text: string): Promise<void>
+  openDisplaySettings(): Promise<void>
+  onDisplaysChanged(callback: () => void): void
+  onCaptureLost(callback: () => void): void
 }
