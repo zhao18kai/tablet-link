@@ -1,4 +1,5 @@
 import { createPeer, transmit } from './peer.ts'
+import { createViewerPointer } from './watch-pointer.ts'
 import type { Signal } from './wire.ts'
 
 const token = location.hash.slice(1)
@@ -12,10 +13,21 @@ const surface = document.querySelector<HTMLButtonElement>('#viewer-surface')!
 const status = document.querySelector<HTMLElement>('#status')!
 const prompt = document.querySelector<HTMLElement>('#viewer-prompt')!
 const stats = document.querySelector<HTMLElement>('#stats')!
+const touchHint = document.querySelector<HTMLElement>('#touch-hint')!
 const video = document.querySelector<HTMLVideoElement>('video')!
 let channel: WebSocket | undefined
 let activePeer: ReturnType<typeof createPeer> | undefined
 let timer: number | undefined
+let touchChannel: RTCDataChannel | undefined
+let touchEnabled = false
+
+const remotePointer = createViewerPointer(video.parentElement!, video, (command) => {
+  if (touchChannel?.readyState !== 'open') return
+  if (command.action === 'move' && touchChannel.bufferedAmount > 4096) return
+  touchChannel.send(JSON.stringify(command))
+}, () => {
+  if (document.fullscreenElement === stage) setControlsVisible(toolbar.hidden === true)
+})
 
 function setControlsVisible(visible: boolean) {
   toolbar.hidden = !visible
@@ -25,20 +37,30 @@ function setControlsVisible(visible: boolean) {
 
 function updateFullscreen() {
   const fullscreen = document.fullscreenElement === stage
+  const immersive = fullscreen && prompt.hidden
   const keyboardEntry = document.activeElement === full && full.matches(':focus-visible')
   const restoreFocus = document.activeElement === surface
-  surface.hidden = !fullscreen || !prompt.hidden
-  setControlsVisible(surface.hidden)
+  surface.hidden = !immersive || touchEnabled
+  setControlsVisible(!immersive)
   full.textContent = fullscreen ? '退出全屏' : '全屏'
   full.disabled = !fullscreen && (!activePeer || !prompt.hidden || !document.fullscreenEnabled)
   if (!surface.hidden && keyboardEntry) surface.focus()
   else if (!fullscreen && restoreFocus && !full.disabled) full.focus()
 }
 
+function updateTouchMode() {
+  touchEnabled = activePeer?.pc.connectionState === 'connected' && touchChannel?.readyState === 'open' && prompt.hidden === true
+  remotePointer.setEnabled(touchEnabled)
+  touchHint.hidden = !touchEnabled
+  updateFullscreen()
+}
+
 function end(message: string) {
   const previous = channel
   channel = undefined
   previous?.close()
+  remotePointer.setEnabled(false)
+  touchChannel = undefined
   activePeer?.pc.close()
   activePeer = undefined
   window.clearTimeout(timer)
@@ -52,7 +74,7 @@ function end(message: string) {
   button.textContent = '重新连接'
   fit.hidden = true
   leave.disabled = true
-  updateFullscreen()
+  updateTouchMode()
 }
 
 async function play() {
@@ -108,10 +130,32 @@ function connect() {
         const peer = createPeer(message.id, (signal) => transmit(socket, signal))
         activePeer = peer
         peer.pc.onconnectionstatechange = () => {
-          if (activePeer === peer && peer.pc.connectionState === 'failed') end('视频连接失败，请重新连接。')
-        }
-        peer.pc.ontrack = ({ track, streams }) => {
           if (activePeer !== peer) return
+          if (peer.pc.connectionState === 'failed') end('视频连接失败，请重新连接。')
+          else if (touchChannel) updateTouchMode()
+        }
+        peer.pc.ondatachannel = ({ channel: controls }) => {
+          if (activePeer !== peer || controls.label !== 'tablet-link-pointer' || touchChannel) {
+            controls.close()
+            return
+          }
+          touchChannel = controls
+          controls.onopen = () => { if (touchChannel === controls) updateTouchMode() }
+          controls.onclose = () => {
+            if (touchChannel === controls) {
+              touchChannel = undefined
+              updateTouchMode()
+            }
+          }
+          updateTouchMode()
+        }
+        peer.pc.ontrack = ({ track, streams, receiver }) => {
+          if (activePeer !== peer) return
+          try {
+            if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 30
+          } catch {
+            // Browsers without a usable setter keep their own adaptive buffer.
+          }
           video.srcObject = streams[0] ?? new MediaStream([track])
           void play()
         }
@@ -132,7 +176,7 @@ video.addEventListener('playing', () => {
   const firstPlayback = !prompt.hidden
   prompt.hidden = true
   fit.hidden = false
-  if (firstPlayback) updateFullscreen()
+  if (firstPlayback) updateTouchMode()
 })
 
 let sample: { decoded: number; time: number } | undefined

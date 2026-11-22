@@ -31,6 +31,7 @@ async function streamScreen(t, extension = false) {
   const browser = await chromium.launch({ executablePath: edge })
   t.after(() => browser.close())
   const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 }, hasTouch: true })
+  let markerPage
 
   await host.locator('#network').selectOption(address)
   if (extension) {
@@ -47,17 +48,30 @@ async function streamScreen(t, extension = false) {
     const listed = await host.locator('#source option').evaluateAll((options) => options.map(({ value }) => value))
     assert.deepEqual(listed, extendedDisplays.map(({ id }) => id))
     await host.locator('#source').selectOption(target.id)
+    await host.getByRole('checkbox', { name: '允许平板触控' }).check()
 
     // Draw a test color on the selected display so a duplicate of the primary cannot pass.
     await app.evaluate(async ({ BrowserWindow, screen }, displayId) => {
       const display = screen.getAllDisplays().find(({ id }) => String(id) === displayId)
       if (!display) throw new Error('The selected display disappeared during the test')
       const marker = new BrowserWindow({
-        ...display.bounds, show: false, frame: false, focusable: false, alwaysOnTop: true, skipTaskbar: true,
+        ...display.bounds, show: false, frame: false, alwaysOnTop: true, skipTaskbar: true,
       })
-      await marker.loadURL('data:text/html,<body style="background:%232f93cb">')
+      const targetPage = `<style>
+          @keyframes sweep { from { transform: translateX(0) } to { transform: translateX(78vw) } }
+          .moving { position: absolute; top: 27px; width: 90px; height: 65px; background: white; animation: sweep 1.8s linear infinite alternate; }
+        </style><body style="background:#2f93cb" data-clicks="0" data-drags="0" data-ups="0"><div class="moving"></div>
+        <script>
+          const count = (key) => { document.body.dataset[key] = Number(document.body.dataset[key]) + 1 }
+          document.addEventListener('click', () => count('clicks'))
+          document.addEventListener('mousemove', event => { if (event.buttons === 1) count('drags') })
+          document.addEventListener('mouseup', () => count('ups'))
+        </script>`
+      await marker.loadURL('data:text/html,' + encodeURIComponent(targetPage))
       marker.showInactive()
     }, target.displayId)
+    markerPage = app.windows().find((page) => page.url().startsWith('data:text/html,'))
+    assert.ok(markerPage, 'The Windows touch test window must be available')
     t.diagnostic(`Extended source: ${target.name} (display ID ${target.displayId})`)
   }
   await host.getByRole('button', { name: '开始共享' }).click()
@@ -91,6 +105,31 @@ async function streamScreen(t, extension = false) {
       const pixel = context.getImageData(0, 0, 1, 1).data
       return [47, 147, 203].every((expected, channel) => Math.abs(pixel[channel] - expected) < 30)
     }, undefined, { timeout: 8000 })
+    await viewer.locator('.screen.touch-enabled').waitFor({ state: 'visible', timeout: 10000 })
+    const measuredFrames = await viewer.locator('video').evaluate(async (video) => {
+      const initial = video.getVideoPlaybackQuality().totalVideoFrames
+      const start = performance.now()
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      return Math.round(1000 * (video.getVideoPlaybackQuality().totalVideoFrames - initial) / (performance.now() - start))
+    })
+    t.diagnostic(`Received about ${measuredFrames} FPS with continuous screen motion`)
+    const center = await videoCenter(viewer)
+    await viewer.touchscreen.tap(center.x, center.y)
+    await markerPage.waitForFunction(() => document.body.dataset.clicks === '1', undefined, { timeout: 6000 })
+
+    const touchscreen = await viewer.context().newCDPSession(viewer)
+    try {
+      await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ ...center, id: 1 }] })
+      await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: center.x + 60, y: center.y + 12, id: 1 }] })
+      await markerPage.waitForFunction(() => Number(document.body.dataset.drags) > 0, undefined, { timeout: 6000 })
+      await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+      await markerPage.waitForFunction(() => Number(document.body.dataset.ups) >= 2, undefined, { timeout: 6000 })
+    } finally {
+      await touchscreen.detach()
+    }
+    t.diagnostic('Tablet-style tap and drag reached the Windows extension; the mouse button was released')
+  } else {
+    await viewer.locator('.screen.touch-enabled').waitFor({ state: 'hidden', timeout: 2000 })
   }
 
   await viewer.getByRole('button', { name: '全屏', exact: true }).click()
@@ -98,7 +137,8 @@ async function streamScreen(t, extension = false) {
   await viewer.locator('.viewer-bar').waitFor({ state: 'hidden', timeout: 3000 })
   const fit = viewer.getByRole('button', { name: '铺满画面（裁边）' })
   const surface = viewer.getByRole('button', { name: '显示全屏控件' })
-  await surface.tap()
+  if (extension) await twoFingerTap(viewer)
+  else await surface.tap()
   assert.equal(await fit.getAttribute('aria-pressed'), 'false')
   assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
   await fit.tap()
@@ -106,11 +146,29 @@ async function streamScreen(t, extension = false) {
   assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'cover')
   await fit.tap()
   assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
-  await viewer.getByRole('button', { name: '隐藏全屏控件' }).tap()
+  if (extension) await twoFingerTap(viewer)
+  else await viewer.getByRole('button', { name: '隐藏全屏控件' }).tap()
   await viewer.locator('.viewer-bar').waitFor({ state: 'hidden' })
 
   await host.getByRole('button', { name: '停止共享' }).click()
   await viewer.waitForFunction(() => document.querySelector('video').srcObject === null)
   await viewer.waitForFunction(() => document.fullscreenElement === null)
   await assert.rejects(fetch(url))
+}
+
+async function videoCenter(viewer) {
+  const box = await viewer.locator('video').boundingBox()
+  assert.ok(box)
+  return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) }
+}
+
+async function twoFingerTap(viewer) {
+  const { x, y } = await videoCenter(viewer)
+  const cdp = await viewer.context().newCDPSession(viewer)
+  try {
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }, { x: x + 32, y, id: 2 }] })
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  } finally {
+    await cdp.detach()
+  }
 }

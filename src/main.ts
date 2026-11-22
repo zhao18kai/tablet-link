@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import qrcode from 'qrcode-generator'
 import { getDisplayRole } from './displays.ts'
 import { startLanServer } from './lan.ts'
+import { displayPointerPosition, parsePointerCommand } from './pointer.ts'
+import { openWindowsPointer } from './windows-pointer.ts'
 import type { CaptureMode, ShareInfo } from './wire.ts'
 
 function networks() {
@@ -42,15 +44,22 @@ async function openWindow() {
   let selected: Capture | undefined
   let capturing: Capture | undefined
   let share: Awaited<ReturnType<typeof startLanServer>> | undefined
+  let pointer: Awaited<ReturnType<typeof openWindowsPointer>> | undefined
   let starting: Promise<ShareInfo> | undefined
+  let stopping: Promise<void> | undefined
   let captureEpoch = 0
 
   async function stopShare() {
+    if (stopping) return stopping
     captureEpoch++
     selected = capturing = undefined
+    const oldPointer = pointer
+    pointer = undefined
     const previous = share
     share = undefined
-    await Promise.all([previous?.stop(), starting?.catch(() => undefined)])
+    stopping = Promise.all([oldPointer?.close(), previous?.stop(), starting?.catch(() => undefined)])
+      .then(() => { stopping = undefined })
+    await stopping
   }
 
   function onTopologyChange(removedId?: number) {
@@ -92,14 +101,23 @@ async function openWindow() {
     }, () => callback({}))
   })
 
+  function fromHost(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent) {
+    return !window.isDestroyed() && event.sender === window.webContents && event.senderFrame === window.webContents.mainFrame
+  }
+
   function handle(name: string, action: (...args: string[]) => unknown) {
     ipcMain.handle(name, (event, ...args: string[]) => {
-      if (event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame) {
-        throw new Error('无效的桌面窗口。')
-      }
+      if (!fromHost(event)) throw new Error('无效的桌面窗口。')
       return action(...args)
     })
   }
+
+  const onRemotePointer = (event: Electron.IpcMainEvent, raw: unknown) => {
+    if (!pointer || !share || !fromHost(event)) return
+    const command = parsePointerCommand(raw)
+    if (command) pointer.send(command)
+  }
+  ipcMain.on('remote-pointer', onRemotePointer)
 
   handle('sources', async () => {
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 320, height: 180 } })
@@ -130,24 +148,41 @@ async function openWindow() {
     }
     selected = { source, mode }
   })
-  handle('start-share', async (address) => {
-    if (starting || share) throw new Error('已有一个共享会话。')
+  handle('start-share', async (address, control) => {
+    if (starting || share || stopping) throw new Error('已有一个共享会话，或上一会话尚在结束。')
     const capture = capturing
     if (!capture || !captureIsAvailable(capture)) throw new Error('所选屏幕已断开。')
+    if (control !== 'view' && (control !== 'touch' || capture.mode !== 'extension' || process.platform !== 'win32')) {
+      throw new Error('请选择 Windows 扩展副屏以使用平板触控。')
+    }
     if (!networks().some((network) => network.address === address)) {
       throw new Error('所选局域网地址已变化。请刷新设备后重试。')
     }
     const startup = (async () => {
       const server = await startLanServer(address, __dirname)
+      let sessionPointer: typeof pointer
       try {
+        if (control === 'touch') {
+          sessionPointer = await openWindowsPointer(join(__dirname, 'tablet-pointer.exe'), (position) => {
+            if (capturing !== capture || !captureIsAvailable(capture)) return
+            const display = screen.getAllDisplays().find(({ id }) => String(id) === capture.source.display_id)
+            if (!display) return
+            return {
+              point: screen.dipToScreenPoint(displayPointerPosition(display.bounds, position)),
+              bounds: screen.dipToScreenRect(null, display.bounds),
+            }
+          })
+        }
         if (capturing !== capture || !captureIsAvailable(capture)) throw new Error('所选屏幕已断开。')
         const code = qrcode(0, 'M')
         code.addData(server.viewerUrl)
         code.make()
         const qr = code.createDataURL(4, 16)
+        pointer = sessionPointer
         share = server
         return { viewerUrl: server.viewerUrl, hostUrl: server.hostUrl, qr }
       } catch (error) {
+        await sessionPointer?.close()
         await server.stop()
         throw error
       }
@@ -164,7 +199,14 @@ async function openWindow() {
   handle('copy', (text) => {
     if (text === share?.viewerUrl) clipboard.writeText(text)
   })
+  app.on('before-quit', (event) => {
+    if (!pointer && !stopping && !starting) return
+    event.preventDefault()
+    void stopShare().then(() => app.quit())
+  })
+  window.webContents.on('render-process-gone', () => void stopShare())
   window.on('closed', () => {
+    ipcMain.off('remote-pointer', onRemotePointer)
     screen.off('display-added', onDisplaysChanged)
     screen.off('display-removed', onDisplayRemoved)
     screen.off('display-metrics-changed', onDisplaysChanged)

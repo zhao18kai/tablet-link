@@ -33,8 +33,9 @@ export interface TabletLink {
   sources(): Promise<CaptureSource[]>
   networks(): Promise<NetworkAddress[]>
   selectSource(id: string, displayId: string, mode: CaptureMode): Promise<void>
-  start(address: string): Promise<ShareInfo>
+  start(address: string, allowTouch: boolean): Promise<ShareInfo>
   stop(): Promise<void>
+  remotePointer(command: string): void
   copy(text: string): Promise<void>
   openDisplaySettings(): Promise<void>
   onDisplaysChanged(callback: () => void): void

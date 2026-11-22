@@ -9,6 +9,8 @@ declare global {
 const api = window.tabletLink
 const modes = document.querySelector<HTMLFieldSetElement>('#modes')!
 const extension = document.querySelector<HTMLInputElement>('#mode-extension')!
+const touchOption = document.querySelector<HTMLLabelElement>('#touch-option')!
+const touch = document.querySelector<HTMLInputElement>('#allow-touch')!
 const displaySettings = document.querySelector<HTMLButtonElement>('#display-settings')!
 const displayHint = document.querySelector<HTMLElement>('#display-hint')!
 const source = document.querySelector<HTMLSelectElement>('#source')!
@@ -46,6 +48,8 @@ function setStatus(message: string, state = 'idle') {
 function updateControls() {
   const sharing = !!stream
   modes.disabled = displaySettings.disabled = source.disabled = network.disabled = refresh.disabled = busy || sharing
+  touchOption.hidden = !extension.checked
+  touch.disabled = busy || sharing || !extension.checked
   start.hidden = sharing
   start.disabled = busy || !source.value || !network.value
   stop.hidden = !sharing
@@ -114,6 +118,7 @@ async function loadDevices(updateStatus = true) {
 }
 
 function closePeer() {
+  if (peer) api.remotePointer('{"action":"cancel"}')
   peer?.pc.close()
   peer = undefined
 }
@@ -147,7 +152,7 @@ async function endShare(message: string, state = 'idle') {
   }
 }
 
-function attachSignaling(channel: WebSocket, media: MediaStream) {
+function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boolean) {
   let queue = Promise.resolve()
   const fail = (id: string) => {
     closePeer()
@@ -178,10 +183,24 @@ function attachSignaling(channel: WebSocket, media: MediaStream) {
         active.pc.onconnectionstatechange = () => {
           if (peer !== active) return
           if (active.pc.connectionState === 'connected') setStatus('正在向平板传输画面', 'active')
-          if (active.pc.connectionState === 'disconnected') setStatus('连接暂时中断，等待恢复', 'pending')
+          if (active.pc.connectionState === 'disconnected') {
+            if (allowTouch) api.remotePointer('{"action":"cancel"}')
+            setStatus('连接暂时中断，等待恢复', 'pending')
+          }
           if (active.pc.connectionState === 'failed') fail(active.id)
         }
         active.pc.addTrack(media.getVideoTracks()[0], media)
+        if (allowTouch) {
+          const controls = active.pc.createDataChannel('tablet-link-pointer')
+          controls.onmessage = ({ data }) => {
+            if (peer === active && active.pc.connectionState === 'connected' && typeof data === 'string' && data.length <= 160) {
+              api.remotePointer(data)
+            }
+          }
+          controls.onclose = () => {
+            if (peer === active) api.remotePointer('{"action":"cancel"}')
+          }
+        }
         await active.publish('offer')
       } else await peer?.accept(message)
     }).catch(() => {
@@ -197,6 +216,7 @@ async function beginShare() {
   const selected = sourceChoice
   if (!selected) return
   const run = ++captureRun
+  const allowTouch = extension.checked && touch.checked
   busy = true
   updateControls()
   setStatus('正在启动屏幕共享…', 'pending')
@@ -204,7 +224,7 @@ async function beginShare() {
     await api.selectSource(selected.id, selected.displayId, extension.checked ? 'extension' : 'screen')
     if (captureRun !== run) return
     const media = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: { max: 1920 }, height: { max: 1250 }, frameRate: { ideal: 30, max: 30 } },
+      video: { width: { max: 1920 }, height: { max: 1250 }, frameRate: { ideal: 60, max: 60 } },
       audio: false,
     })
     if (captureRun !== run) {
@@ -218,7 +238,7 @@ async function beginShare() {
     track.addEventListener('ended', () => {
       if (captureRun === run) void endShare('所选屏幕已停止捕获。', 'error')
     }, { once: true })
-    const share = await api.start(network.value)
+    const share = await api.start(network.value, allowTouch)
     if (captureRun !== run) return
     const channel = new WebSocket(share.hostUrl)
     socket = channel
@@ -228,7 +248,7 @@ async function beginShare() {
       channel.addEventListener('close', () => rejectOpen(new Error('局域网连接已关闭。')), { once: true })
     })
     if (captureRun !== run) return
-    attachSignaling(channel, media)
+    attachSignaling(channel, media, allowTouch)
     url.value = share.viewerUrl
     qr.src = share.qr
     instructions.hidden = true
