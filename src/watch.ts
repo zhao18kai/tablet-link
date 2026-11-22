@@ -1,6 +1,7 @@
 import { createPeer, transmit } from './peer.ts'
 import { createViewerPointer } from './watch-pointer.ts'
 import { createRotationTransition } from './watch-rotation.ts'
+import { createStreamStats } from './watch-stats.ts'
 import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type Signal } from './wire.ts'
 
 const token = location.hash.slice(1)
@@ -13,9 +14,10 @@ const toolbar = document.querySelector<HTMLElement>('#viewer-bar')!
 const surface = document.querySelector<HTMLButtonElement>('#viewer-surface')!
 const status = document.querySelector<HTMLElement>('#status')!
 const prompt = document.querySelector<HTMLElement>('#viewer-prompt')!
-const stats = document.querySelector<HTMLElement>('#stats')!
+const streamHud = document.querySelector<HTMLElement>('#stream-hud')!
 const touchHint = document.querySelector<HTMLElement>('#touch-hint')!
 const video = document.querySelector<HTMLVideoElement>('video')!
+const streamStats = createStreamStats(streamHud, video)
 const portraitViewport = window.matchMedia('(orientation: portrait)')
 let channel: WebSocket | undefined
 let activePeer: ReturnType<typeof createPeer> | undefined
@@ -64,6 +66,7 @@ function updateFullscreen() {
   setControlsVisible(!immersive)
   full.textContent = fullscreen ? '退出全屏' : '全屏'
   full.disabled = !fullscreen && (!activePeer || !prompt.hidden || !document.fullscreenEnabled)
+  if (!full.disabled) full.removeAttribute('title')
   if (!surface.hidden && keyboardEntry) surface.focus()
   else if (!fullscreen && restoreFocus && !full.disabled) full.focus()
 }
@@ -92,8 +95,7 @@ function resetConnection(closeCode?: number) {
   window.clearTimeout(interruptedTimer)
   interruptedTimer = undefined
   video.srcObject = null
-  stats.textContent = ''
-  sample = undefined
+  streamStats.reset()
   prompt.hidden = false
   fit.hidden = true
   updateTouchMode()
@@ -219,10 +221,13 @@ function connect(resuming = false) {
         timer = window.setTimeout(() => connectionLost('已连接电脑，但未收到画面。请重试。'), firstFrameTimeout)
         const peer = createPeer(message.id, (signal) => transmit(socket, signal))
         activePeer = peer
+        streamStats.setConnection(message.connectionMode)
         followOrientation = message.followOrientation === true
         reportOrientation()
         peer.pc.onconnectionstatechange = () => {
           if (activePeer !== peer) return
+          const state = peer.pc.connectionState
+          streamStats.setInterrupted(state === 'disconnected')
           window.clearTimeout(interruptedTimer)
           interruptedTimer = undefined
           if (peer.pc.connectionState === 'failed') connectionLost('视频连接失败，请重新连接。')
@@ -278,27 +283,16 @@ video.addEventListener('playing', () => {
   retryCount = 0
   const firstPlayback = !prompt.hidden
   prompt.hidden = true
+  streamStats.show()
   fit.hidden = false
   if (firstPlayback) updateTouchMode()
 })
 
-let sample: { decoded: number; time: number } | undefined
 window.setInterval(async () => {
   const peer = activePeer
-  if (!peer || !prompt.hidden) {
-    sample = undefined
-    return
-  }
+  if (!peer || streamHud.hidden) return
   const report = await peer.pc.getStats().catch(() => undefined)
-  if (!report || activePeer !== peer) return
-  for (const value of report.values()) {
-    if (value.type !== 'inbound-rtp' || value.kind !== 'video' || typeof value.framesDecoded !== 'number') continue
-    const decoded = value.framesDecoded as number
-    const time = value.timestamp as number
-    const fps = sample && time > sample.time ? Math.round(1000 * (decoded - sample.decoded) / (time - sample.time)) : undefined
-    stats.textContent = `${video.videoWidth} × ${video.videoHeight}${fps !== undefined && fps >= 0 ? ` · ${fps} FPS` : ''}`
-    sample = { decoded, time }
-  }
+  if (report && activePeer === peer && !streamHud.hidden) streamStats.update(report)
 }, 1000)
 
 full.addEventListener('click', async () => {
@@ -306,7 +300,8 @@ full.addEventListener('click', async () => {
     if (document.fullscreenElement === stage) await document.exitFullscreen()
     else await stage.requestFullscreen({ navigationUI: 'hide' })
   } catch {
-    stats.textContent = '当前浏览器无法进入全屏'
+    full.title = '当前浏览器无法进入全屏'
+    full.textContent = '全屏不可用'
     full.disabled = true
   }
 })

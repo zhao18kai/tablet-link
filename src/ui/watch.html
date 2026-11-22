@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>平板智联 · 接收画面</title>
   <link rel="stylesheet" href="app.css">
   <script defer src="watch.js"></script>
@@ -13,7 +13,6 @@
       <h1>平板智联</h1>
       <div class="viewer-actions">
         <span id="touch-hint" hidden>双指滑动滚动，双指轻触显示全屏控件</span>
-        <span id="stats" aria-label="接收画面参数"></span>
         <button class="quiet" id="fit" type="button" aria-pressed="false" hidden>铺满画面（裁边）</button>
         <button class="quiet" id="fullscreen" type="button" disabled>全屏</button>
         <button class="quiet" id="leave" type="button" disabled>断开</button>
@@ -23,6 +22,25 @@
       <video autoplay muted playsinline aria-label="来自 Windows 电脑的屏幕画面"></video>
       <canvas id="rotation-frame" aria-hidden="true" hidden></canvas>
       <button id="viewer-surface" type="button" aria-label="显示全屏控件" aria-controls="viewer-bar" aria-expanded="false" hidden></button>
+      <div class="stream-hud" id="stream-hud" aria-label="串流状态" hidden>
+        <div class="stream-summary">
+          <div class="stream-tags">
+            <span id="stream-state">串流中</span>
+            <span class="stream-tag stream-link" id="stream-connection"></span>
+            <span class="stream-tag" id="stream-codec" hidden></span>
+          </div>
+          <div class="stream-readings">
+            <span id="stream-fps">— FPS</span>
+            <span class="stream-reading"><span>码率</span><span id="stream-bitrate">— Mb/s</span></span>
+            <span class="stream-reading"><span>往返</span><span id="stream-rtt">— ms</span></span>
+            <span id="stream-resolution">— × —</span>
+          </div>
+        </div>
+        <div class="stream-trend">
+          <span>近 30 秒帧率</span>
+          <canvas id="stream-history" aria-hidden="true"></canvas>
+        </div>
+      </div>
       <div class="viewer-prompt" id="viewer-prompt">
         <p id="status" role="status">发起请求后，请在电脑上允许连接。</p>
         <button id="connect" class="primary" type="button">请求观看</button>

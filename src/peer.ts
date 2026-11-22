@@ -4,11 +4,26 @@ export function transmit(socket: WebSocket, message: Signal) {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message))
 }
 
-export function createPeer(id: string, emit: (signal: Signal) => void) {
+export function preferScreenH264(pc: RTCPeerConnection, sender: RTCRtpSender) {
+  const transceiver = pc.getTransceivers().find((candidate) => candidate.sender === sender)
+  const codecs = RTCRtpSender.getCapabilities('video')?.codecs
+  if (!transceiver || !codecs) return
+  const h264 = codecs.filter((codec) => codec.mimeType === 'video/H264')
+  if (!h264.length) return
+  try {
+    transceiver.setCodecPreferences([...h264, ...codecs.filter((codec) => codec.mimeType !== 'video/H264')])
+  } catch {
+    // Keep the default negotiation when the platform cannot reorder codecs.
+  }
+}
+
+export function createPeer(id: string, emit: (signal: Signal) => void, localAddress?: string) {
   const pc = new RTCPeerConnection({ iceServers: [] })
   const pending: RTCIceCandidateInit[] = []
   pc.onicecandidate = ({ candidate }) => {
-    if (candidate) emit({ type: 'ice', id, candidate: candidate.toJSON() })
+    if (candidate && (!localAddress || (candidate.address === localAddress && candidate.type === 'host'))) {
+      emit({ type: 'ice', id, candidate: candidate.toJSON() })
+    }
   }
 
   return {
@@ -17,7 +32,8 @@ export function createPeer(id: string, emit: (signal: Signal) => void) {
     async publish(type: 'offer' | 'answer') {
       const description = type === 'offer' ? await pc.createOffer() : await pc.createAnswer()
       await pc.setLocalDescription(description)
-      emit({ type, id, description })
+      const sdp = localAddress ? description.sdp?.replace(/^a=candidate:[^\r\n]*\r?\n/gm, '') : description.sdp
+      emit({ type, id, description: { type, sdp } })
     },
     async accept(message: Signal) {
       if (message.type === 'offer' || message.type === 'answer') {

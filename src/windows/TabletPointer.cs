@@ -163,7 +163,7 @@ internal static class TabletPointer
         SetThreadDpiAwarenessContext(new IntPtr(-4)); // Per-monitor DPI aware v2
         if (args.Length != 0)
         {
-            Environment.ExitCode = VirtualDisplay.Rotate(args);
+            Environment.ExitCode = VirtualDisplay.Change(args);
             return;
         }
         using (var watchdog = new Timer(_ =>

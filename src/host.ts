@@ -1,8 +1,8 @@
-import { selectCaptureSource } from './displays.ts'
+import { selectCaptureSource, type DisplaySide } from './displays.ts'
 import { createDragMotion } from './drag-motion.ts'
-import { createPeer, transmit } from './peer.ts'
+import { createPeer, preferScreenH264, transmit } from './peer.ts'
 import { parsePointerCommand } from './pointer.ts'
-import type { CaptureSource, Signal, TabletLink } from './wire.ts'
+import type { CaptureSource, ConnectionMode, NetworkAddress, Signal, TabletLink } from './wire.ts'
 
 declare global {
   interface Window { tabletLink: TabletLink }
@@ -19,6 +19,20 @@ const displaySettings = document.querySelector<HTMLButtonElement>('#display-sett
 const displayHint = document.querySelector<HTMLElement>('#display-hint')!
 const source = document.querySelector<HTMLSelectElement>('#source')!
 const network = document.querySelector<HTMLSelectElement>('#network')!
+const connectionMode = document.querySelector<HTMLSelectElement>('#connection-mode')!
+const usbHint = document.querySelector<HTMLElement>('#usb-hint')!
+const connectionInstruction = document.querySelector<HTMLElement>('#connection-instruction')!
+const placement = document.querySelector<HTMLElement>('#placement')!
+const referenceScreen = document.querySelector<HTMLSelectElement>('#reference-screen')!
+const displaySide = document.querySelector<HTMLSelectElement>('#display-side')!
+const applyPosition = document.querySelector<HTMLButtonElement>('#apply-position')!
+const positionStatus = document.querySelector<HTMLElement>('#position-status')!
+const captureSize = document.querySelector<HTMLSelectElement>('#capture-size')!
+const captureFps = document.querySelector<HTMLSelectElement>('#capture-fps')!
+const applyQuality = document.querySelector<HTMLButtonElement>('#apply-quality')!
+const qualityStatus = document.querySelector<HTMLElement>('#quality-status')!
+const pageTitle = document.querySelector<HTMLElement>('#page-title')!
+const pages = [...document.querySelectorAll<HTMLButtonElement>('.sidebar-nav button')]
 const preview = document.querySelector<HTMLImageElement>('#source-preview')!
 const start = document.querySelector<HTMLButtonElement>('#start')!
 const stop = document.querySelector<HTMLButtonElement>('#stop')!
@@ -34,8 +48,12 @@ const qr = document.querySelector<HTMLImageElement>('#qr')!
 const copy = document.querySelector<HTMLButtonElement>('#copy')!
 
 let sources: CaptureSource[] = []
+let networks: NetworkAddress[] = []
 let sourceChoice: CaptureSource | null | undefined
 let stream: MediaStream | undefined
+let captureFollowsOrientation = false
+let applyingQuality = false
+let appliedQuality = { size: restoreQuality(captureSize), fps: restoreQuality(captureFps) }
 let socket: WebSocket | undefined
 let peer: ReturnType<typeof createPeer> | undefined
 let dragMotion: ReturnType<typeof createDragMotion> | undefined
@@ -52,15 +70,36 @@ function setStatus(message: string, state = 'idle') {
 
 function updateControls() {
   const sharing = !!stream
-  modes.disabled = displaySettings.disabled = source.disabled = network.disabled = refresh.disabled = busy || sharing
+  modes.disabled = displaySettings.disabled = source.disabled = connectionMode.disabled = refresh.disabled = busy || sharing
+  network.disabled = busy || sharing || !network.value
   touchOption.hidden = !extension.checked
   touch.disabled = busy || sharing || !extension.checked
-  orientationOption.hidden = !extension.checked || !sourceChoice?.canRotate
+  orientationOption.hidden = placement.hidden = !extension.checked || !sourceChoice?.canRotate
   orientation.disabled = busy || sharing || orientationOption.hidden
+  referenceScreen.disabled = displaySide.disabled = applyPosition.disabled = busy || sharing || placement.hidden || !referenceScreen.value
   start.hidden = sharing
-  start.disabled = busy || !source.value || !network.value
+  start.disabled = busy || applyingQuality || !source.value || !network.value
   stop.hidden = !sharing
   stop.disabled = busy
+  captureSize.disabled = captureFps.disabled = applyingQuality
+  applyQuality.disabled = busy || applyingQuality ||
+    (captureSize.value === appliedQuality.size && captureFps.value === appliedQuality.fps)
+}
+
+function restoreQuality(field: HTMLSelectElement) {
+  const saved = localStorage.getItem('tablet-link:' + field.id)
+  if (saved && [...field.options].some(({ value }) => value === saved)) field.value = saved
+  return field.value
+}
+
+function captureConstraints(quality: typeof appliedQuality, followOrientation: boolean): MediaTrackConstraints {
+  const size = Number(quality.size)
+  const fps = Number(quality.fps)
+  return {
+    width: { max: size },
+    height: { max: followOrientation ? size : 2 * Math.round(size * 625 / 1920) },
+    frameRate: { ideal: fps, max: fps },
+  }
 }
 
 function updatePreview() {
@@ -87,11 +126,22 @@ function renderSources() {
     source.value = ''
   }
   displayHint.hidden = !extension.checked
+  const references = sources.filter(({ role, canRotate }) => role === 'primary' || (role === 'extension' && !canRotate))
+    .sort((left, right) => Number(right.role === 'primary') - Number(left.role === 'primary'))
+  fillSelect(referenceScreen, references.map(({ displayId, name }) => [displayId, name]), '没有可用的参考屏')
   updatePreview()
 }
 
+function renderNetworks() {
+  const usb = connectionMode.value === 'usb'
+  const choices = networks.filter(({ mode }) => mode === connectionMode.value)
+  fillSelect(network, choices.map(({ name, address }) => [address, name + ' · ' + address]), usb ? '未检测到 USB 网络' : '未连接到局域网')
+  usbHint.hidden = !usb
+  connectionInstruction.textContent = usb ? '用数据线连接平板，并开启平板的 USB 共享网络。' : '让电脑和 MatePad 接入同一个局域网。'
+}
+
 function showReadiness() {
-  if (!network.value) setStatus('请连接局域网后刷新设备')
+  if (!network.value) setStatus(connectionMode.value === 'usb' ? '等待 USB 共享网络' : '请连接局域网后刷新设备')
   else if (source.value) setStatus('可以开始共享')
   else if (extension.checked && !sources.some(({ role }) => role === 'extension')) setStatus('等待 Windows 启用扩展屏')
   else setStatus('请选择要共享的屏幕')
@@ -110,9 +160,10 @@ async function loadDevices(updateStatus = true) {
   busy = true
   updateControls()
   try {
-    const [availableSources, networks] = await Promise.all([api.sources(), api.networks()])
+    const [availableSources, availableNetworks] = await Promise.all([api.sources(), api.networks()])
     sources = availableSources
-    fillSelect(network, networks.map(({ name, address }) => [address, `${name} · ${address}`]), '未连接到局域网')
+    networks = availableNetworks
+    renderNetworks()
     renderSources()
     if (updateStatus) showReadiness()
   } catch {
@@ -165,7 +216,14 @@ async function endShare(message: string, state = 'idle') {
   }
 }
 
-function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boolean) {
+async function usesUsbAddress(pc: RTCPeerConnection, address: string) {
+  const report = await pc.getStats()
+  const transport = [...report.values()].find((item) => item.type === 'transport' && item.selectedCandidatePairId)
+  const pair = transport && report.get(transport.selectedCandidatePairId)
+  return !!pair && report.get(pair.localCandidateId)?.address === address
+}
+
+function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boolean, preferHardwareVideo: boolean, usbAddress?: string) {
   let queue = Promise.resolve()
   const fail = (id: string) => {
     closePeer()
@@ -191,13 +249,23 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
       } else if (message.type === 'approved') {
         const active = createPeer(message.id, (signal) => {
           if (peer === active) transmit(channel, signal)
-        })
+        }, usbAddress)
         peer = active
         const sender = active.pc.addTrack(media.getVideoTracks()[0], media)
+        if (preferHardwareVideo) preferScreenH264(active.pc, sender)
         dragMotion = allowTouch ? createDragMotion(sender) : undefined
-        active.pc.onconnectionstatechange = () => {
+        active.pc.onconnectionstatechange = async () => {
           if (peer !== active) return
           if (active.pc.connectionState === 'connected') {
+            if (usbAddress) {
+              const onUsb = await usesUsbAddress(active.pc, usbAddress).catch(() => false)
+              if (peer !== active || active.pc.connectionState !== 'connected') return
+              if (!onUsb) {
+                fail(message.id)
+                setStatus('视频未走所选 USB 网卡，请检查平板的 USB 共享网络。', 'error')
+                return
+              }
+            }
             void dragMotion?.enable()
             setStatus('正在向平板传输画面', 'active')
           }
@@ -241,6 +309,8 @@ async function beginShare() {
   const run = ++captureRun
   const allowTouch = extension.checked && touch.checked
   const followOrientation = extension.checked && selected.canRotate && orientation.checked
+  const mode = connectionMode.value as ConnectionMode
+  const address = network.value
   busy = true
   updateControls()
   setStatus('正在启动屏幕共享…', 'pending')
@@ -248,7 +318,7 @@ async function beginShare() {
     await api.selectSource(selected.id, selected.displayId, extension.checked ? 'extension' : 'screen')
     if (captureRun !== run) return
     const media = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: { max: 1920 }, height: { max: followOrientation ? 1920 : 1250 }, frameRate: { ideal: 60, max: 60 } },
+      video: captureConstraints(appliedQuality, followOrientation),
       audio: false,
     })
     if (captureRun !== run) {
@@ -256,13 +326,14 @@ async function beginShare() {
       return
     }
     stream = media
+    captureFollowsOrientation = followOrientation
     const [track] = media.getVideoTracks()
     track.contentHint = 'detail'
     if (track.readyState === 'ended') throw new Error('所选屏幕已停止捕获。')
     track.addEventListener('ended', () => {
       if (captureRun === run) void endShare('所选屏幕已停止捕获。', 'error')
     }, { once: true })
-    const share = await api.start(network.value, allowTouch, followOrientation)
+    const share = await api.start(address, allowTouch, followOrientation, mode)
     if (captureRun !== run) return
     const channel = new WebSocket(share.hostUrl)
     socket = channel
@@ -272,7 +343,7 @@ async function beginShare() {
       channel.addEventListener('close', () => rejectOpen(new Error('局域网连接已关闭。')), { once: true })
     })
     if (captureRun !== run) return
-    attachSignaling(channel, media, allowTouch)
+    attachSignaling(channel, media, allowTouch, extension.checked && selected.canRotate, mode === 'usb' ? address : undefined)
     url.value = share.viewerUrl
     qr.src = share.qr
     instructions.hidden = true
@@ -290,6 +361,7 @@ async function beginShare() {
 
 source.addEventListener('change', () => {
   sourceChoice = sources.find(({ id }) => id === source.value) ?? null
+  positionStatus.textContent = ''
   updatePreview()
   showReadiness()
   updateControls()
@@ -298,14 +370,84 @@ network.addEventListener('change', () => {
   showReadiness()
   updateControls()
 })
+connectionMode.addEventListener('change', () => {
+  renderNetworks()
+  showReadiness()
+  updateControls()
+})
 modes.addEventListener('change', () => {
   sourceChoice = undefined
+  positionStatus.textContent = ''
   renderSources()
   showReadiness()
   updateControls()
 })
 displaySettings.addEventListener('click', () => {
   void api.openDisplaySettings().catch(() => setStatus('请从 Windows 设置打开显示设置。', 'error'))
+})
+for (const field of [referenceScreen, displaySide]) {
+  field.addEventListener('change', () => { positionStatus.textContent = '' })
+}
+applyPosition.addEventListener('click', async () => {
+  if (!sourceChoice?.canRotate || !referenceScreen.value || busy || stream) return
+  busy = true
+  updateControls()
+  positionStatus.textContent = '正在应用…'
+  try {
+    await api.placeDisplay(sourceChoice.displayId, referenceScreen.value, displaySide.value as DisplaySide)
+    positionStatus.textContent = '已应用副屏位置'
+  } catch (error) {
+    positionStatus.textContent = error instanceof Error
+      ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : '无法调整副屏位置。'
+  } finally {
+    busy = false
+    updateControls()
+    if (topologyChanged) scheduleDisplayRefresh()
+  }
+})
+for (const page of pages) {
+  page.addEventListener('click', () => {
+    pageTitle.textContent = page.textContent
+    for (const item of pages) {
+      if (item === page) item.setAttribute('aria-current', 'page')
+      else item.removeAttribute('aria-current')
+      document.getElementById(item.dataset.page!)!.hidden = item !== page
+    }
+  })
+}
+for (const field of [captureSize, captureFps]) {
+  field.addEventListener('change', () => {
+    qualityStatus.textContent = ''
+    updateControls()
+  })
+}
+applyQuality.addEventListener('click', async () => {
+  if (applyQuality.disabled) return
+  const next = { size: captureSize.value, fps: captureFps.value }
+  const track = stream?.getVideoTracks()[0]
+  applyingQuality = true
+  qualityStatus.textContent = '正在应用…'
+  updateControls()
+  try {
+    if (track?.readyState === 'live') {
+      await track.applyConstraints(captureConstraints(next, captureFollowsOrientation))
+    }
+    localStorage.setItem('tablet-link:' + captureSize.id, next.size)
+    localStorage.setItem('tablet-link:' + captureFps.id, next.fps)
+    appliedQuality = next
+    qualityStatus.textContent = track?.readyState === 'live' ? '已应用到当前共享' : '已保存，下次共享时生效'
+  } catch {
+    qualityStatus.textContent = '应用失败，请重试。'
+  } finally {
+    applyingQuality = false
+    updateControls()
+  }
+})
+void api.getVersion().then((version) => {
+  document.querySelector('#app-version')!.textContent = '版本 ' + version
+}).catch(() => {})
+document.querySelector('#open-project')!.addEventListener('click', () => {
+  void api.openProject().catch(() => setStatus('无法打开 GitHub 项目页面。', 'error'))
 })
 refresh.addEventListener('click', () => void loadDevices())
 start.addEventListener('click', () => void beginShare())

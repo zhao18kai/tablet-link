@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { getDisplayRole, selectCaptureSource } from '../src/displays.ts'
+import { getDisplayRole, getDisplayPlacement, selectCaptureSource } from '../src/displays.ts'
 
 test('only displays with a separate desktop origin qualify as extended screens', () => {
   const displays = [
@@ -39,4 +39,17 @@ test('the selected screen is matched by display ID after Electron renumbers its 
   const previous = { id: 'screen:2:0', displayId: '11' }
   const newTarget = { id: 'screen:3:0', displayId: '11' }
   assert.equal(selectCaptureSource([newTarget], previous), newTarget)
+})
+
+test('the virtual display can be placed beside a reference without overlapping other displays', () => {
+  const laptop = { id: 1, bounds: { x: -1920, y: 0, width: 1920, height: 1080 } }
+  const external = { id: 2, bounds: { x: 0, y: 0, width: 2560, height: 1440 } }
+  const virtual = { id: 3, bounds: { x: 2560, y: 0, width: 1250, height: 1920 } }
+  const displays = [laptop, external, virtual]
+
+  assert.deepEqual(getDisplayPlacement(displays, virtual, laptop, 'left'), { x: -3170, y: 0 })
+  assert.deepEqual(getDisplayPlacement(displays, virtual, external, 'right'), { x: 2560, y: 0 })
+  assert.deepEqual(getDisplayPlacement(displays, virtual, laptop, 'above'), { x: -1920, y: -1920 })
+  assert.deepEqual(getDisplayPlacement(displays, virtual, external, 'below'), { x: 0, y: 1440 })
+  assert.equal(getDisplayPlacement(displays, virtual, external, 'left'), undefined)
 })

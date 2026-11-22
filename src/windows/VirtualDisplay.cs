@@ -6,6 +6,8 @@ internal static class VirtualDisplay
 {
     private const int CurrentSettings = -1;
     private const uint TestMode = 0x00000002;
+    private const uint UpdateRegistry = 0x00000001;
+    private const uint PositionField = 0x00000020;
     private const uint RotationFields = 0x00000080 | 0x00080000 | 0x00100000;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -40,6 +42,8 @@ internal static class VirtualDisplay
     {
         [FieldOffset(68)] public ushort Size;
         [FieldOffset(72)] public uint Fields;
+        [FieldOffset(76)] public int X;
+        [FieldOffset(80)] public int Y;
         [FieldOffset(84)] public uint Orientation;
         [FieldOffset(172)] public uint Width;
         [FieldOffset(176)] public uint Height;
@@ -47,6 +51,11 @@ internal static class VirtualDisplay
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromPoint(Point point, uint flags);
+
+    private delegate bool MonitorCallback(IntPtr monitor, IntPtr dc, ref Rect bounds, IntPtr data);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorCallback callback, IntPtr data);
 
     [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     private static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);
@@ -60,12 +69,16 @@ internal static class VirtualDisplay
     [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     private static extern int ChangeDisplaySettingsExW(string device, ref DisplayMode mode, IntPtr window, uint flags, IntPtr reserved);
 
-    public static int Rotate(string[] args)
+    public static int Change(string[] args)
     {
-        if (args.Length != 6 || args[0] != "--orient-display" || (args[1] != "portrait" && args[1] != "landscape")) return 1;
+        bool placing = args[0] == "--place-display";
+        if (placing ? args.Length != 7 : args.Length != 6 || args[0] != "--orient-display" ||
+            (args[1] != "portrait" && args[1] != "landscape")) return 1;
+
+        int offset = placing ? 1 : 2;
         var bounds = new Rect();
-        if (!ParseCoordinate(args[2], out bounds.Left) || !ParseCoordinate(args[3], out bounds.Top) ||
-            !ParseCoordinate(args[4], out bounds.Right) || !ParseCoordinate(args[5], out bounds.Bottom) ||
+        if (!ParseCoordinate(args[offset], out bounds.Left) || !ParseCoordinate(args[offset + 1], out bounds.Top) ||
+            !ParseCoordinate(args[offset + 2], out bounds.Right) || !ParseCoordinate(args[offset + 3], out bounds.Bottom) ||
             bounds.Left >= bounds.Right || bounds.Top >= bounds.Bottom) return 1;
 
         var center = new Point { X = bounds.Left / 2 + bounds.Right / 2, Y = bounds.Top / 2 + bounds.Bottom / 2 };
@@ -79,6 +92,19 @@ internal static class VirtualDisplay
 
         var mode = new DisplayMode { Size = (ushort)Marshal.SizeOf(typeof(DisplayMode)) };
         if (!EnumDisplaySettingsExW(info.Device, CurrentSettings, ref mode, 0)) return 3;
+        if (placing)
+        {
+            if (!ParseCoordinate(args[5], out mode.X) || !ParseCoordinate(args[6], out mode.Y)) return 1;
+            var target = new Rect
+            {
+                Left = mode.X, Top = mode.Y,
+                Right = mode.X + (bounds.Right - bounds.Left), Bottom = mode.Y + (bounds.Bottom - bounds.Top)
+            };
+            if (!CanPlace(monitor, target)) return 2;
+            mode.Fields = PositionField;
+            return Apply(info.Device, ref mode, UpdateRegistry);
+        }
+
         bool portrait = args[1] == "portrait";
         if ((mode.Height > mode.Width) == portrait) return 0;
         mode.Orientation = portrait ? 1u : 0u;
@@ -86,8 +112,29 @@ internal static class VirtualDisplay
         mode.Width = mode.Height;
         mode.Height = width;
         mode.Fields = RotationFields;
-        if (ChangeDisplaySettingsExW(info.Device, ref mode, IntPtr.Zero, TestMode, IntPtr.Zero) != 0) return 4;
-        return ChangeDisplaySettingsExW(info.Device, ref mode, IntPtr.Zero, 0, IntPtr.Zero) == 0 ? 0 : 5;
+        return Apply(info.Device, ref mode, 0);
+    }
+
+    private static int Apply(string device, ref DisplayMode mode, uint flags)
+    {
+        if (ChangeDisplaySettingsExW(device, ref mode, IntPtr.Zero, TestMode, IntPtr.Zero) != 0) return 4;
+        return ChangeDisplaySettingsExW(device, ref mode, IntPtr.Zero, flags, IntPtr.Zero) == 0 ? 0 : 5;
+    }
+
+    private static bool CanPlace(IntPtr monitor, Rect target)
+    {
+        bool adjacent = false;
+        bool overlap = false;
+        return EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr current, IntPtr dc, ref Rect other, IntPtr data)
+        {
+            if (current == monitor) return true;
+            bool sharesX = target.Left < other.Right && target.Right > other.Left;
+            bool sharesY = target.Top < other.Bottom && target.Bottom > other.Top;
+            overlap |= sharesX && sharesY;
+            adjacent |= (sharesX && (target.Top == other.Bottom || target.Bottom == other.Top)) ||
+                (sharesY && (target.Left == other.Right || target.Right == other.Left));
+            return !overlap;
+        }, IntPtr.Zero) && adjacent && !overlap;
     }
 
     private static bool ParseCoordinate(string value, out int coordinate)

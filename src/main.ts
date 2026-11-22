@@ -1,25 +1,16 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, Menu, screen, shell } from 'electron'
 import { execFile } from 'node:child_process'
-import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import qrcode from 'qrcode-generator'
-import { getDisplayRole } from './displays.ts'
+import { getDisplayPlacement, getDisplayRole } from './displays.ts'
 import { startLanServer } from './lan.ts'
+import { networks } from './networks.ts'
 import { displayPointerPosition, parsePointerCommand } from './pointer.ts'
 import { openWindowsPointer } from './windows-pointer.ts'
 import type { CaptureMode, DisplayOrientation, ShareInfo } from './wire.ts'
 
 const runDisplayCommand = promisify(execFile)
-
-function networks() {
-  return Object.entries(networkInterfaces()).flatMap(([name, entries]) =>
-    (entries ?? [])
-      .filter(({ address, family, internal }) => family === 'IPv4' && !internal &&
-        /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address))
-      .map(({ address }) => ({ name, address })),
-  ).sort((left, right) => Number(/wi-?fi|wlan/i.test(right.name)) - Number(/wi-?fi|wlan/i.test(left.name)))
-}
 
 interface Capture {
   source: Electron.DesktopCapturerSource
@@ -37,8 +28,8 @@ async function openWindow() {
   Menu.setApplicationMenu(null)
   const window = new BrowserWindow({
     title: '平板智联',
-    width: 945,
-    height: 685,
+    width: 1080,
+    height: 800,
     minWidth: 650,
     minHeight: 540,
     backgroundColor: '#eef2ef',
@@ -51,6 +42,7 @@ async function openWindow() {
   let pointer: Awaited<ReturnType<typeof openWindowsPointer>> | undefined
   let starting: Promise<ShareInfo> | undefined
   let stopping: Promise<void> | undefined
+  let placing = false
   let captureEpoch = 0
   let rotation = Promise.resolve()
   let orientationRequest = 0
@@ -160,6 +152,7 @@ async function openWindow() {
   })
   handle('networks', networks)
   handle('select-source', async (id, displayId, mode) => {
+    if (placing) throw new Error('正在调整副屏位置。')
     const epoch = ++captureEpoch
     selected = undefined
     if (mode !== 'screen' && mode !== 'extension') throw new Error('无效的共享模式。')
@@ -170,20 +163,25 @@ async function openWindow() {
     }
     selected = { source, mode }
   })
-  handle('start-share', async (address, control, orientationMode) => {
-    if (starting || share || stopping) throw new Error('已有一个共享会话，或上一会话尚在结束。')
+  handle('start-share', async (address, control, orientationMode, connectionMode) => {
+    if (starting || share || stopping || placing) throw new Error('请等当前操作结束后再开始共享。')
     const capture = capturing
     if (!capture || !captureIsAvailable(capture)) throw new Error('所选屏幕已断开。')
     if (control !== 'view' && (control !== 'touch' || capture.mode !== 'extension' || process.platform !== 'win32')) {
       throw new Error('请选择 Windows 扩展副屏以使用平板触控。')
     }
-    if (!networks().some((network) => network.address === address)) {
-      throw new Error('所选局域网地址已变化。请刷新设备后重试。')
-    }
+    if (connectionMode !== 'lan' && connectionMode !== 'usb') throw new Error('无效的连接方式。')
     const followOrientation = orientationMode === 'follow' && capture.mode === 'extension' && process.platform === 'win32' &&
       screen.getAllDisplays().some(({ id, label }) => String(id) === capture.source.display_id && label === 'VDD by MTT')
     const startup = (async () => {
-      const server = await startLanServer(address, __dirname, followOrientation ? (direction) => orientSharedVdd(capture, direction) : undefined)
+      const addresses = await networks()
+      if (!addresses.some((network) => network.address === address && network.mode === connectionMode)) {
+        throw new Error('所选网络地址已变化。请刷新设备后重试。')
+      }
+      if (capturing !== capture || !captureIsAvailable(capture)) throw new Error('所选屏幕已断开。')
+      const server = await startLanServer(
+        address, __dirname, followOrientation ? (direction) => orientSharedVdd(capture, direction) : undefined, connectionMode,
+      )
       let sessionPointer: typeof pointer
       try {
         if (control === 'touch') {
@@ -220,6 +218,37 @@ async function openWindow() {
   })
   handle('stop-share', stopShare)
   handle('open-display-settings', () => shell.openExternal('ms-settings:display'))
+  handle('app-version', () => app.getVersion())
+  handle('open-project', () => shell.openExternal('https://github.com/zhao18kai/tablet-link'))
+  handle('place-display', async (displayId, referenceId, side) => {
+    if (process.platform !== 'win32') throw new Error('副屏位置设置仅支持 Windows。')
+    if (placing || selected || capturing || share || starting || stopping) throw new Error('停止共享后可以调整副屏位置。')
+    if (side !== 'left' && side !== 'right' && side !== 'above' && side !== 'below') throw new Error('请选择位置方向。')
+    const displays = screen.getAllDisplays()
+    const primaryId = screen.getPrimaryDisplay().id
+    const target = displays.find(({ id }) => String(id) === displayId)
+    const reference = displays.find(({ id }) => String(id) === referenceId)
+    if (target?.label !== 'VDD by MTT' || getDisplayRole(displayId, displays, primaryId) !== 'extension' ||
+        !reference || reference.id === target.id || reference.label === 'VDD by MTT' ||
+        getDisplayRole(referenceId, displays, primaryId) === 'mirror') {
+      throw new Error('显示器已变化。请刷新设备后重新选择。')
+    }
+    const physical = ({ id, bounds }: Electron.Display) => ({ id, bounds: screen.dipToScreenRect(null, bounds) })
+    const { x, y, width, height } = physical(target).bounds
+    const position = getDisplayPlacement(displays.map(physical), physical(target), physical(reference), side)
+    if (!position) throw new Error('该位置已有其他屏幕。请选择其他参考屏或方向。')
+    if (position.x === x && position.y === y) return
+    placing = true
+    try {
+      await runDisplayCommand(join(__dirname, 'tablet-pointer.exe'), [
+        '--place-display', ...[x, y, x + width, y + height, position.x, position.y].map(String),
+      ], { windowsHide: true, timeout: 5000 })
+    } catch {
+      throw new Error('Windows 未能应用副屏位置，请刷新设备后重试。')
+    } finally {
+      placing = false
+    }
+  })
   handle('copy', (text) => {
     if (text === share?.viewerUrl) clipboard.writeText(text)
   })
@@ -238,6 +267,10 @@ async function openWindow() {
   })
   await window.loadFile(join(__dirname, 'host.html'))
 }
+
+// Only the bundled host page uses this renderer. USB offers need a literal IP to select their NIC.
+const disabledFeatures = app.commandLine.getSwitchValue('disable-features')
+app.commandLine.appendSwitch('disable-features', [disabledFeatures, 'WebRtcHideLocalIpsWithMdns'].filter(Boolean).join(','))
 
 if (!app.requestSingleInstanceLock()) {
   app.quit()

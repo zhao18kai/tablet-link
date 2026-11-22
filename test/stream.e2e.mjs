@@ -75,6 +75,12 @@ async function streamScreen(t, extension = false) {
   })
   let markerPage
 
+  const navigation = host.getByRole('navigation', { name: '应用导航' })
+  await navigation.getByRole('button', { name: '画质设置' }).click()
+  await host.getByLabel('最高帧率').waitFor({ state: 'visible' })
+  await navigation.getByRole('button', { name: '关于' }).click()
+  await host.getByRole('button', { name: 'GitHub 源码' }).waitFor({ state: 'visible' })
+  await navigation.getByRole('button', { name: '屏幕连接' }).click()
   await host.locator('#network').selectOption(address)
   if (extension) {
     const screens = await host.evaluate(() => window.tabletLink.sources())
@@ -136,6 +142,42 @@ async function streamScreen(t, extension = false) {
   }, undefined, { timeout: 20000 })
   const dimensions = await viewer.locator('video').evaluate((video) => [video.videoWidth, video.videoHeight])
   t.diagnostic(`Decoded ${dimensions.join(' × ')} video from Windows screen capture`)
+  const streamHud = viewer.locator('#stream-hud')
+  await streamHud.waitFor({ state: 'visible' })
+  await viewer.waitForFunction(() => /\d+ FPS/.test(document.querySelector('#stream-hud').textContent))
+  assert.match(await streamHud.innerText(), /串流中.*Wi-Fi \/ 局域网/s)
+  assert.ok((await streamHud.innerText()).includes(dimensions.join(' × ')))
+  assert.match(await streamHud.locator('#stream-bitrate').innerText(), /\d+\.\d+ Mb\/s/)
+  await viewer.waitForFunction(() => {
+    const graph = document.querySelector('#stream-history')
+    const pixels = graph.getContext('2d').getImageData(0, 0, graph.width, graph.height).data
+    for (let i = 0; i < pixels.length; i += 4) {
+      if (pixels[i + 1] > 200 && pixels[i + 1] > pixels[i] + 80 && pixels[i + 3] > 180) return true
+    }
+    return false
+  })
+
+  await navigation.getByRole('button', { name: '画质设置' }).click()
+  const resolutionLimit = host.getByLabel('采集分辨率上限')
+  const frameLimit = host.getByLabel('最高帧率')
+  const initialLimits = [await resolutionLimit.inputValue(), await frameLimit.inputValue()]
+  const targetFps = initialLimits[1] === '30' ? '45' : '30'
+  await viewer.evaluate(() => { window.testQualityStream = document.querySelector('video').srcObject })
+  await resolutionLimit.selectOption('1280')
+  await frameLimit.selectOption(targetFps)
+  await host.getByRole('button', { name: '应用', exact: true }).click()
+  await host.getByText('已应用到当前共享').waitFor({ state: 'visible' })
+  await viewer.waitForFunction(() => {
+    const video = document.querySelector('video')
+    return video.srcObject === window.testQualityStream && Math.max(video.videoWidth, video.videoHeight) <= 1280
+  })
+  const appliedFps = await host.evaluate(() => window.testPeer.getSenders()[0].track.getSettings().frameRate)
+  assert.ok(appliedFps > 0 && appliedFps <= Number(targetFps))
+  await resolutionLimit.selectOption(initialLimits[0])
+  await frameLimit.selectOption(initialLimits[1])
+  await host.getByRole('button', { name: '应用', exact: true }).click()
+  await host.getByText('已应用到当前共享').waitFor({ state: 'visible' })
+  await navigation.getByRole('button', { name: '屏幕连接' }).click()
 
   if (extension) {
     await viewer.waitForFunction(() => {
@@ -187,6 +229,8 @@ async function streamScreen(t, extension = false) {
   await viewer.getByRole('button', { name: '全屏', exact: true }).click()
   await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
   await viewer.locator('.viewer-bar').waitFor({ state: 'hidden', timeout: 3000 })
+  assert.ok(await streamHud.isVisible())
+  assert.equal(await streamHud.evaluate((node) => getComputedStyle(node).pointerEvents), 'none')
   const fit = viewer.getByRole('button', { name: '铺满画面（裁边）' })
   const surface = viewer.getByRole('button', { name: '显示全屏控件' })
   if (extension) await twoFingerTap(viewer)

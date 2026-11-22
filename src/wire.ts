@@ -1,4 +1,4 @@
-import type { DisplayRole } from './displays.ts'
+import type { DisplayRole, DisplaySide } from './displays.ts'
 
 export const SHARE_ENDED = 4000
 export const VIEWER_LEAVING = 4001
@@ -9,11 +9,12 @@ export type MediaSignal =
   | { type: 'ice'; candidate: RTCIceCandidateInit }
 
 export type DisplayOrientation = 'landscape' | 'portrait'
+export type ConnectionMode = 'lan' | 'usb'
 
 export type Signal = (
   | MediaSignal
   | { type: 'viewer-request'; resumed?: boolean }
-  | { type: 'approved'; resumeToken?: string; followOrientation?: true }
+  | { type: 'approved'; resumeToken?: string; followOrientation?: true; connectionMode?: ConnectionMode }
   | { type: 'orientation'; direction: DisplayOrientation }
   | { type: 'viewer-left' | 'approve' | 'reject' | 'rejected' }
 ) & { id: string }
@@ -32,6 +33,7 @@ export type CaptureMode = 'screen' | 'extension'
 export interface NetworkAddress {
   name: string
   address: string
+  mode: ConnectionMode
 }
 
 export interface ShareInfo {
@@ -44,11 +46,14 @@ export interface TabletLink {
   sources(): Promise<CaptureSource[]>
   networks(): Promise<NetworkAddress[]>
   selectSource(id: string, displayId: string, mode: CaptureMode): Promise<void>
-  start(address: string, allowTouch: boolean, followOrientation: boolean): Promise<ShareInfo>
+  start(address: string, allowTouch: boolean, followOrientation: boolean, mode: ConnectionMode): Promise<ShareInfo>
   stop(): Promise<void>
   remotePointer(command: string): void
   copy(text: string): Promise<void>
   openDisplaySettings(): Promise<void>
+  placeDisplay(displayId: string, referenceId: string, side: DisplaySide): Promise<void>
+  getVersion(): Promise<string>
+  openProject(): Promise<void>
   onDisplaysChanged(callback: () => void): void
   onCaptureLost(callback: () => void): void
 }

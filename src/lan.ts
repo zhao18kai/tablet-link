@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
-import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type DisplayOrientation, type Signal } from './wire.ts'
+import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type ConnectionMode, type DisplayOrientation, type Signal } from './wire.ts'
 
 const resumeGraceMs = 60_000
 const closeGraceMs = 1_000
@@ -53,7 +53,9 @@ function readSignal(text: string): Signal | undefined {
   }
 }
 
-export async function startLanServer(address: string, directory: string, onOrientation?: (direction: DisplayOrientation) => void) {
+export async function startLanServer(
+  address: string, directory: string, onOrientation?: (direction: DisplayOrientation) => void, connectionMode?: ConnectionMode,
+) {
   const hostToken = randomBytes(24).toString('base64url')
   const viewerToken = randomBytes(24).toString('base64url')
   const websocket = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 })
@@ -93,7 +95,11 @@ export async function startLanServer(address: string, directory: string, onOrien
 
   function approveViewer(current: Viewer, resumeToken: string) {
     resumeGrant = { token: resumeToken, id: current.id }
-    send(current.socket, { type: 'approved', id: current.id, resumeToken, ...(onOrientation && { followOrientation: true as const }) })
+    send(current.socket, {
+      type: 'approved', id: current.id, resumeToken,
+      ...(onOrientation && { followOrientation: true as const }),
+      ...(connectionMode && { connectionMode }),
+    })
     send(host, { type: 'approved', id: current.id })
   }
 
