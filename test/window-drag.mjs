@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { _electron, chromium } from 'playwright-core'
 
-assert.ok(process.argv[2], 'Usage: node test/window-drag.mjs <Tablet-Link.exe> [--tablet]')
+assert.ok(process.argv[2], 'Usage: node test/window-drag.mjs <Tablet-Link.exe> [--tablet|--continuous]')
 const executablePath = resolve(process.argv[2])
 const edge = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles].filter(Boolean)
   .map((directory) => join(directory, 'Microsoft', 'Edge', 'Application', 'msedge.exe')).find(existsSync)
@@ -93,6 +93,21 @@ async function measure({ host, windowSession, windowId, display, left, top, trav
     const height = scale * element.videoHeight
     return { x: rect.x + (rect.width - width) / 2, y: rect.y + (rect.height - height) / 2, width, height }
   })
+  const session = await viewer.context().newCDPSession(viewer)
+  const point = (offset) => ({ x: Math.round(video.x + (left - display.x + 565 + offset) * video.width / display.width),
+    y: Math.round(video.y + (top - display.y + 15) * video.height / display.height), id: 1 })
+  const touches = (type, offset) => session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [point(offset)] })
+  const startDrag = async (offset) => {
+    await touches('touchStart', offset)
+    await touches('touchMove', offset + 24)
+    await delay(120)
+    await touches('touchMove', offset)
+    await delay(120)
+  }
+  if (process.argv.includes('--continuous')) {
+    await measureContinuous({ host, viewer, startDrag, touches, travel, windowSession, windowId })
+    return
+  }
   await viewer.evaluate(({ x, y, width, height }) => {
     const element = document.querySelector('video')
     const canvas = document.createElement('canvas')
@@ -167,17 +182,6 @@ async function measure({ host, windowSession, windowId, display, left, top, trav
   }
   const before = await receiverStats()
   const senderBefore = await senderStats()
-  const session = await viewer.context().newCDPSession(viewer)
-  const point = (offset) => ({ x: Math.round(video.x + (left - display.x + 565 + offset) * video.width / display.width),
-    y: Math.round(video.y + (top - display.y + 15) * video.height / display.height), id: 1 })
-  const touches = (type, offset) => session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [point(offset)] })
-  const startDrag = async (offset) => {
-    await touches('touchStart', offset)
-    await touches('touchMove', offset + 24)
-    await delay(120)
-    await touches('touchMove', offset)
-    await delay(120)
-  }
   const nativeMoves = []
   const attempts = 20
   // The fixed stops distinguish each returned window position while exercising the normal drag path.
@@ -252,5 +256,77 @@ async function measure({ host, windowSession, windowId, display, left, top, trav
     decode: average('totalDecodeTime', 'framesDecoded'),
     encode: encoded > 0 ? Math.round(1000 * (senderAfter.totalEncodeTime - senderBefore.totalEncodeTime) / encoded) : undefined,
     encoder: senderAfter.encoderImplementation,
+  }))
+}
+
+async function measureContinuous({ host, viewer, startDrag, touches, travel, windowSession, windowId }) {
+  const hasSenderCounters = await host.evaluate(async () => {
+    const sender = window.windowDragPeer.getSenders().find(({ track }) => track.kind === 'video')
+    const report = await sender.getStats()
+    const outbound = [...report.values()].find((entry) => entry.type === 'outbound-rtp' && entry.kind === 'video')
+    return Number.isFinite(outbound?.framesSent) && Number.isFinite(report.get(outbound?.mediaSourceId)?.frames)
+  })
+  assert.ok(hasSenderCounters, 'The live sender stats must expose captured and sent frame counters')
+  const senderStats = () => host.evaluate(async () => {
+    const pc = window.windowDragPeer
+    const sender = pc.getSenders().find(({ track }) => track.kind === 'video')
+    const report = await pc.getStats()
+    const outbound = [...report.values()].find((entry) => entry.type === 'outbound-rtp' && entry.kind === 'video')
+    const transport = report.get(outbound.transportId)
+    const connection = report.get(transport?.selectedCandidatePairId)
+    return {
+      hint: sender.track.contentHint,
+      preference: sender.getParameters().degradationPreference,
+      captureFps: report.get(outbound.mediaSourceId)?.framesPerSecond,
+      codec: report.get(outbound.codecId)?.mimeType,
+      availableBitrate: connection?.availableOutgoingBitrate,
+      outbound,
+    }
+  })
+  const videoStats = () => viewer.locator('video').evaluate((video) => {
+    const { totalVideoFrames, droppedVideoFrames } = video.getVideoPlaybackQuality()
+    return { resolution: [video.videoWidth, video.videoHeight], displayed: totalVideoFrames - droppedVideoFrames }
+  })
+  const positions = []
+  let updates = 0
+  let before, beforeVideo, after, afterVideo
+  try {
+    await startDrag(0)
+    const start = performance.now()
+    while (performance.now() - start < 9500) {
+      const elapsed = performance.now() - start
+      if (!before && elapsed >= 3500) {
+        before = await senderStats()
+        beforeVideo = await videoStats()
+      }
+      const offset = Math.round((travel - 30) * (1 - Math.cos(2 * Math.PI * elapsed / 650)))
+      await touches('touchMove', offset)
+      if (++updates % 8 === 0) {
+        const { bounds } = await windowSession.send('Browser.getWindowBounds', { windowId })
+        positions.push(bounds.left)
+      }
+      await delay(8)
+    }
+    after = await senderStats()
+    afterVideo = await videoStats()
+  } finally {
+    await touches('touchEnd')
+  }
+  assert.ok(before && beforeVideo, 'The sender and viewer must be measured after warmup')
+  const windowTravel = Math.max(...positions) - Math.min(...positions)
+  assert.ok(windowTravel >= travel, `The Edge window must follow the drag (moved ${windowTravel} pixels)`)
+  await host.waitForFunction(() => window.windowDragPeer.getSenders().find(({ track }) => track.kind === 'video').track.contentHint === 'detail',
+    undefined, { timeout: 3000 })
+  const seconds = (after.outbound.timestamp - before.outbound.timestamp) / 1000
+  const fps = (count) => Math.round(count / seconds * 10) / 10
+  console.log(JSON.stringify({
+    app: 'Microsoft Edge', updates, windowTravel, motionHint: after.hint, resolutionPreference: after.preference,
+    resolution: afterVideo.resolution, codec: after.codec,
+    capturedFps: after.captureFps,
+    sentFps: fps(after.outbound.framesSent - before.outbound.framesSent),
+    displayedFps: fps(afterVideo.displayed - beforeVideo.displayed),
+    targetMbps: Math.round(after.outbound.targetBitrate / 1e5) / 10,
+    availableMbps: Math.round(after.availableBitrate / 1e5) / 10,
+    limit: after.outbound.qualityLimitationReason,
   }))
 }

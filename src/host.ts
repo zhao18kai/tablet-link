@@ -1,5 +1,7 @@
 import { selectCaptureSource } from './displays.ts'
+import { createDragMotion } from './drag-motion.ts'
 import { createPeer, transmit } from './peer.ts'
+import { parsePointerCommand } from './pointer.ts'
 import type { CaptureSource, Signal, TabletLink } from './wire.ts'
 
 declare global {
@@ -34,6 +36,7 @@ let sourceChoice: CaptureSource | null | undefined
 let stream: MediaStream | undefined
 let socket: WebSocket | undefined
 let peer: ReturnType<typeof createPeer> | undefined
+let dragMotion: ReturnType<typeof createDragMotion> | undefined
 let busy = false
 let requestId: string | undefined
 let captureRun = 0
@@ -117,8 +120,14 @@ async function loadDevices(updateStatus = true) {
   }
 }
 
-function closePeer() {
+function resetPointer() {
+  dragMotion?.reset()
   if (peer) api.remotePointer('{"action":"cancel"}')
+}
+
+function closePeer() {
+  resetPointer()
+  dragMotion = undefined
   peer?.pc.close()
   peer = undefined
 }
@@ -180,11 +189,16 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
           if (peer === active) transmit(channel, signal)
         })
         peer = active
+        const sender = active.pc.addTrack(media.getVideoTracks()[0], media)
+        dragMotion = allowTouch ? createDragMotion(sender) : undefined
         active.pc.onconnectionstatechange = () => {
           if (peer !== active) return
-          if (active.pc.connectionState === 'connected') setStatus('正在向平板传输画面', 'active')
+          if (active.pc.connectionState === 'connected') {
+            void dragMotion?.enable()
+            setStatus('正在向平板传输画面', 'active')
+          }
           if (active.pc.connectionState === 'disconnected') {
-            if (allowTouch) api.remotePointer('{"action":"cancel"}')
+            if (allowTouch) resetPointer()
             setStatus('连接暂时中断，等待恢复', 'pending')
           }
           if (active.pc.connectionState === 'failed') {
@@ -192,16 +206,18 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
             setStatus('视频连接中断，等待平板重连', 'pending')
           }
         }
-        active.pc.addTrack(media.getVideoTracks()[0], media)
         if (allowTouch) {
           const controls = active.pc.createDataChannel('tablet-link-pointer')
           controls.onmessage = ({ data }) => {
-            if (peer === active && active.pc.connectionState === 'connected' && typeof data === 'string' && data.length <= 160) {
+            if (peer === active && active.pc.connectionState === 'connected' && typeof data === 'string') {
+              const command = parsePointerCommand(data)
+              if (!command) return
               api.remotePointer(data)
+              dragMotion?.input(command)
             }
           }
           controls.onclose = () => {
-            if (peer === active) api.remotePointer('{"action":"cancel"}')
+            if (peer === active) resetPointer()
           }
         }
         await active.publish('offer')

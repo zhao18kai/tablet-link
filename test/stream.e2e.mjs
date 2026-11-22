@@ -25,6 +25,39 @@ async function streamScreen(t, extension = false) {
   })
   t.after(() => app.close())
   const host = await app.firstWindow()
+  await host.evaluate(() => {
+    const Original = window.RTCPeerConnection
+    window.RTCPeerConnection = class extends Original {
+      constructor(...args) {
+        super(...args)
+        window.testPeer = this
+      }
+    }
+    const hint = Object.getOwnPropertyDescriptor(MediaStreamTrack.prototype, 'contentHint')
+    window.testContentHints = []
+    Object.defineProperty(MediaStreamTrack.prototype, 'contentHint', {
+      ...hint,
+      set(value) {
+        hint.set.call(this, value)
+        window.testContentHints.push(this.contentHint)
+      },
+    })
+    const getStats = RTCRtpSender.prototype.getStats
+    let previousTime, captured = 0, sent = 0
+    RTCRtpSender.prototype.getStats = async function () {
+      if (!window.testSlowDelivery) return getStats.call(this)
+      // Control only the sampled counters so the actual input and media paths still run.
+      const timestamp = performance.now()
+      const elapsed = (timestamp - (previousTime ?? timestamp)) / 1000
+      previousTime = timestamp
+      captured += elapsed * 48
+      sent += elapsed * (this.track.contentHint === 'motion' ? 46 : 18)
+      return new Map([
+        ['screen', { type: 'media-source', frames: captured }],
+        ['out', { type: 'outbound-rtp', kind: 'video', mediaSourceId: 'screen', timestamp, framesSent: sent }],
+      ])
+    }
+  })
   host.on('console', (message) => {
     if (message.type() === 'error') t.diagnostic(message.text().replace(/(token|resume)=[\w-]+/g, '$1=[redacted]'))
   })
@@ -125,15 +158,25 @@ async function streamScreen(t, extension = false) {
     const center = await videoCenter(viewer)
     await viewer.touchscreen.tap(center.x, center.y)
     await markerPage.waitForFunction(() => document.body.dataset.clicks === '1', undefined, { timeout: 6000 })
+    assert.deepEqual(await host.evaluate(() => window.testContentHints), ['detail'])
 
     const touchscreen = await viewer.context().newCDPSession(viewer)
     try {
+      await host.evaluate(() => { window.testSlowDelivery = true })
       await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ ...center, id: 1 }] })
-      await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: center.x + 60, y: center.y + 12, id: 1 }] })
+      for (let step = 1; step <= 7; step++) {
+        await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: center.x + step * 12, y: center.y + 12, id: 1 }] })
+        await new Promise((resolve) => setTimeout(resolve, 55))
+      }
+      await host.waitForFunction(() => window.testContentHints.includes('motion'), undefined, { timeout: 4000 })
       await markerPage.waitForFunction(() => Number(document.body.dataset.drags) > 0, undefined, { timeout: 6000 })
       await touchscreen.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
       await markerPage.waitForFunction(() => Number(document.body.dataset.ups) >= 2, undefined, { timeout: 6000 })
+      await host.waitForFunction(() => window.testContentHints.join(',') === 'detail,motion,detail', undefined, { timeout: 4000 })
+      const preference = await host.evaluate(() => window.testPeer.getSenders()[0].getParameters().degradationPreference)
+      assert.equal(preference, 'maintain-resolution')
     } finally {
+      await host.evaluate(() => { window.testSlowDelivery = false })
       await touchscreen.detach()
     }
     t.diagnostic('Tablet-style tap and drag reached the Windows extension; the mouse button was released')
@@ -188,7 +231,10 @@ async function streamScreen(t, extension = false) {
   }, undefined, { timeout: 12000 })
   assert.equal(await viewer.evaluate(() => document.fullscreenElement?.id), 'stage')
   assert.equal(await approve.isVisible(), false)
-  if (extension) await viewer.locator('.screen.touch-enabled').waitFor({ state: 'visible' })
+  if (extension) {
+    await viewer.locator('.screen.touch-enabled').waitFor({ state: 'visible' })
+    await host.waitForFunction(() => window.testPeer.getSenders()[0].getParameters().degradationPreference === 'maintain-resolution')
+  }
   t.diagnostic('The same approved viewer reconnected automatically and stayed fullscreen')
 
   await host.getByRole('button', { name: '停止共享' }).click()
