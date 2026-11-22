@@ -5,6 +5,7 @@ const pixelsPerWheelNotch = 24
 const wheelNotch = 120
 
 type ClientPoint = Pick<PointerEvent, 'clientX' | 'clientY'>
+type WheelCommand = Extract<PointerCommand, { action: 'wheel' }>
 
 function midpoint(a: ClientPoint, b: ClientPoint): ClientPoint {
   return { clientX: (a.clientX + b.clientX) / 2, clientY: (a.clientY + b.clientY) / 2 }
@@ -20,7 +21,7 @@ export function createViewerPointer(
   const fingers = new Map<number, { initial: PointerEvent; last: ClientPoint }>()
   let gesture: { active: boolean; tap: boolean; lastY: number; distance: number } | undefined
   let stroke: { id: number; initial: PointerEvent; point: { x: number; y: number }; last: { x: number; y: number }; dragging: boolean } | undefined
-  let queued: PointerCommand | undefined
+  let queuedWheel: WheelCommand | undefined
   let frame = 0
 
   function position(point: ClientPoint, clamp = false) {
@@ -28,25 +29,24 @@ export function createViewerPointer(
       video.classList.contains('video-cover'), point.clientX, point.clientY, clamp)
   }
 
-  function clearMove() {
+  function clearWheel() {
     window.cancelAnimationFrame(frame)
     frame = 0
-    queued = undefined
+    queuedWheel = undefined
   }
 
-  function flushMove() {
-    const command = queued
-    clearMove()
+  function flushWheel() {
+    const command = queuedWheel
+    clearWheel()
     if (command) send(command)
   }
 
-  function queueMove(command: PointerCommand) {
-    queued = command
-    if (!frame) frame = window.requestAnimationFrame(flushMove)
+  function queueWheel(command: WheelCommand) {
+    queuedWheel = command
+    if (!frame) frame = window.requestAnimationFrame(flushWheel)
   }
 
   function cancelStroke() {
-    clearMove()
     if (stroke?.dragging) send({ action: 'cancel' })
     stroke = undefined
   }
@@ -71,10 +71,10 @@ export function createViewerPointer(
     const notches = Math.trunc(gesture.distance / pixelsPerWheelNotch)
     if (!notches) return
     gesture.distance %= pixelsPerWheelNotch
-    const pending = queued?.action === 'wheel' ? queued.delta : 0
+    const pending = queuedWheel?.delta ?? 0
     const delta = Math.max(-maxPointerWheelDelta, Math.min(maxPointerWheelDelta, pending + notches * wheelNotch))
-    if (delta) queueMove({ action: 'wheel', ...point, delta })
-    else clearMove()
+    if (delta) queueWheel({ action: 'wheel', ...point, delta })
+    else clearWheel()
   }
 
   area.addEventListener('pointerdown', (event) => {
@@ -87,7 +87,7 @@ export function createViewerPointer(
     if (gesture) {
       gesture.active = false
       gesture.tap = false
-      clearMove()
+      clearWheel()
       return
     }
     if (first) {
@@ -115,7 +115,7 @@ export function createViewerPointer(
     const point = position(event, true)
     if (point) {
       stroke.last = point
-      queueMove({ action: 'move', ...point })
+      send({ action: 'move', ...point })
     }
   })
 
@@ -125,7 +125,7 @@ export function createViewerPointer(
       trackGesture(event)
       fingers.delete(event.pointerId)
       gesture.active = false
-      flushMove()
+      flushWheel()
       if (!fingers.size) {
         const tap = gesture.tap
         gesture = undefined
@@ -140,7 +140,6 @@ export function createViewerPointer(
       cancelStroke()
       return
     }
-    clearMove()
     if (!stroke.dragging) send({ action: 'down', ...point })
     send({ action: 'up', ...point })
     stroke = undefined
@@ -150,7 +149,7 @@ export function createViewerPointer(
     if (!fingers.delete(event.pointerId)) return
     if (stroke?.id === event.pointerId) cancelStroke()
     if (gesture) {
-      clearMove()
+      clearWheel()
       gesture.active = false
       gesture.tap = false
       if (!fingers.size) gesture = undefined
@@ -160,13 +159,14 @@ export function createViewerPointer(
   area.addEventListener('pointercancel', cancelPointer)
   area.addEventListener('lostpointercapture', cancelPointer)
   window.setInterval(() => {
-    if (stroke?.dragging && !queued) send({ action: 'move', ...stroke.last })
+    if (stroke?.dragging) send({ action: 'move', ...stroke.last })
   }, 500)
 
   return {
     setEnabled(value: boolean) {
       enabled = value
       if (!enabled) {
+        clearWheel()
         cancelStroke()
         fingers.clear()
         gesture = undefined

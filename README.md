@@ -51,11 +51,13 @@ npm.cmd run package:win
 
 端到端测试使用 Windows 的实际屏幕采集和本机另一个 Edge 进程，需有桌面会话及私有 IPv4 地址。扩展屏测试还需 Windows 已启用第二块扩展显示器。打包输出位于 `release/Tablet-Link-<版本>-win32-<架构>/`。
 
-使用 Virtual Display Driver 时，可在源码目录运行下方命令打开 MatePad 拖拽延迟测试。用平板扫码并点击 **请求观看**，在电脑上点击 **允许连接**，然后从画面左侧匀速拖到右侧，约 3 秒。接收页显示有效样本数、中位数和 P95，估算的是从触控事件到对应视频帧预计呈现的时间。
+使用 Virtual Display Driver 时，可在源码目录运行下方命令，在扩展屏上打开一个真实的 Edge 窗口。用 MatePad 扫码获准连接后，单指拖动窗口顶部的空白标题栏。也可以把记事本等日常应用移到扩展屏，试拖窗、点按和滚动。
 
 ```powershell
-node test/drag-latency.mjs release/Tablet-Link-0.4.0-win32-x64 --tablet
+node test/window-drag.mjs release/Tablet-Link-0.4.1-win32-x64/Tablet-Link.exe --tablet
 ```
+
+省去 `--tablet` 时，脚本用本机另一个 Edge 进程接收视频并拖动该窗口，统计从触控事件到画面预计呈现的时间，以及窗口移动、视频采集、回传和播放的时间。使用同一扩展屏依次测试各版本。
 
 ## 许可证
 

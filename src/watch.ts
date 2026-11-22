@@ -204,7 +204,7 @@ function connect(resuming = false) {
         peer.pc.ontrack = ({ track, streams, receiver }) => {
           if (activePeer !== peer) return
           try {
-            if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 30
+            if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0
           } catch {
             // Browsers without a usable setter keep their own adaptive buffer.
           }

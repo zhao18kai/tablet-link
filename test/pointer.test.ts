@@ -144,7 +144,23 @@ test('wheel motion in the letterbox is discarded and large movements have a sing
   assert.equal('delta' in pointer.commands[0] && pointer.commands[0].delta, 480)
 })
 
-test('disabling the pointer discards buffered movement and releases an active drag', (t) => {
+test('drag positions reach the channel before the next animation frame', (t) => {
+  const pointer = viewerPointer(t)
+  pointer.emit('down', 1, 450, 300)
+  pointer.emit('move', 1, 450, 330)
+  pointer.emit('move', 1, 450, 360)
+  assert.deepEqual(pointer.commands, [
+    { action: 'down', x: 0.5, y: 0.5 },
+    { action: 'move', x: 0.5, y: 0.55 },
+    { action: 'move', x: 0.5, y: 0.6 },
+  ])
+  pointer.emit('up', 1, 450, 390)
+  pointer.frame()
+  assert.deepEqual(pointer.commands.at(-1), { action: 'up', x: 0.5, y: 0.65 })
+  assert.equal(pointer.commands.length, 4)
+})
+
+test('disabling the pointer releases an active drag and ignores subsequent events', (t) => {
   const pointer = viewerPointer(t)
   pointer.emit('down', 1, 450, 300)
   pointer.emit('up', 1, 450, 300)
@@ -157,6 +173,7 @@ test('disabling the pointer discards buffered movement and releases an active dr
     { action: 'down', x: 0.5, y: 0.5 },
     { action: 'up', x: 0.5, y: 0.5 },
     { action: 'down', x: 0.5, y: 0.5 },
+    { action: 'move', x: 0.5, y: 0.55 },
     { action: 'cancel' },
   ])
 })
