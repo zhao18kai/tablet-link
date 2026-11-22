@@ -4,9 +4,11 @@ export const dragTarget = `<!doctype html><meta charset="utf-8"><style>
   body{margin:0;background:#163859;color:white;font:34px system-ui;display:grid;height:100vh;place-content:center;text-align:center;user-select:none}
   #bits{position:absolute;inset:0 0 auto;height:12vh;display:flex}#bits i{flex:1;background:black}
   #scroll{position:absolute;inset:76vh 25% 8vh;overflow:auto;border:2px solid #73b0d4;font-size:24px}
+  #scroll p{box-sizing:border-box;min-height:100%;margin:0;padding:.8em}
+  #scroll p+p{background:#235543}
 </style><div id="bits"><i></i><i></i><i></i><i></i><i></i><i></i></div>
 <h1>拖拽延迟测试</h1><p>用一根手指从画面左侧匀速拖到右侧，约 3 秒</p>
-<section id="scroll"><p>双指在这里向上滑动</p><p>滚动后会看到下一行</p><p>滚动成功</p></section>
+<section id="scroll"><p>双指在这里向上滑动</p><p>滚动成功 · 双指向下滑可返回</p></section>
 <script>
   const cells = document.querySelectorAll('#bits i');
   window.addEventListener('mousemove', event => {

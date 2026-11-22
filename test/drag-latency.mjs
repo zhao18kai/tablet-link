@@ -47,6 +47,11 @@ try {
     console.log('二维码已准备。请在电脑端允许平板的观看请求，然后从左向右匀速拖动。结果会显示在接收页，关闭测试窗口即可结束。')
     await host.waitForEvent('close', { timeout: 0 })
   } else {
+    const marker = app.windows().find((window) => window.url().startsWith('data:text/html;'))
+    assert.ok(marker, 'The Windows drag and scroll test window must be available')
+    const scrollBox = marker.locator('#scroll')
+    const scrollRange = await scrollBox.evaluate((box) => box.scrollHeight - box.clientHeight)
+    assert.ok(scrollRange > 0, 'The test box must have content beyond its visible area')
     const edge = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles].filter(Boolean)
       .map((directory) => join(directory, 'Microsoft', 'Edge', 'Application', 'msedge.exe')).find(existsSync)
     assert.ok(edge, 'Local calibration requires Microsoft Edge')
@@ -70,7 +75,22 @@ try {
       const sampleProgress = await probe.evaluate(({ dataset }) => ({ ...dataset }))
       throw new Error(`Drag probe did not finish: ${JSON.stringify(sampleProgress)}`, { cause: error })
     })
-    console.log(JSON.stringify({ receiver: 'local Edge', ...JSON.parse(await probe.getAttribute('data-summary')) }))
+    const video = await page.locator('video').evaluate((element) => {
+      const rect = element.getBoundingClientRect()
+      const scale = Math.min(rect.width / element.videoWidth, rect.height / element.videoHeight)
+      const height = scale * element.videoHeight
+      return { x: rect.x + rect.width / 2, y: rect.y + (rect.height - height) / 2, height }
+    })
+    const scrollY = Math.round(video.y + video.height * .86)
+    const fingers = (dy) => [{ x: Math.round(video.x - 24), y: scrollY + dy, id: 1 },
+      { x: Math.round(video.x + 24), y: scrollY + dy, id: 2 }]
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: fingers(0) })
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: fingers(-48) })
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+    await marker.waitForFunction((minimum) => document.querySelector('#scroll').scrollTop >= minimum,
+      Math.min(scrollRange, 60), { timeout: 6000 })
+    const scrollPixels = await scrollBox.evaluate((box) => box.scrollTop)
+    console.log(JSON.stringify({ receiver: 'local Edge', ...JSON.parse(await probe.getAttribute('data-summary')), scrollPixels }))
   }
 } finally {
   await browser?.close().catch(() => {})
