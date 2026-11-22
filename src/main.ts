@@ -1,12 +1,16 @@
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, Menu, screen, shell } from 'electron'
+import { execFile } from 'node:child_process'
 import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import qrcode from 'qrcode-generator'
 import { getDisplayRole } from './displays.ts'
 import { startLanServer } from './lan.ts'
 import { displayPointerPosition, parsePointerCommand } from './pointer.ts'
 import { openWindowsPointer } from './windows-pointer.ts'
-import type { CaptureMode, ShareInfo } from './wire.ts'
+import type { CaptureMode, DisplayOrientation, ShareInfo } from './wire.ts'
+
+const runDisplayCommand = promisify(execFile)
 
 function networks() {
   return Object.entries(networkInterfaces()).flatMap(([name, entries]) =>
@@ -48,16 +52,33 @@ async function openWindow() {
   let starting: Promise<ShareInfo> | undefined
   let stopping: Promise<void> | undefined
   let captureEpoch = 0
+  let rotation = Promise.resolve()
+  let orientationRequest = 0
+
+  function orientSharedVdd(capture: Capture, direction: DisplayOrientation) {
+    const request = ++orientationRequest
+    rotation = rotation.then(async () => {
+      if (request !== orientationRequest || !share || capturing !== capture || !captureIsAvailable(capture)) return
+      const display = screen.getAllDisplays().find(({ id }) => String(id) === capture.source.display_id)
+      if (display?.label !== 'VDD by MTT' || (display.bounds.height > display.bounds.width) === (direction === 'portrait')) return
+      const { x, y, width, height } = screen.dipToScreenRect(null, display.bounds)
+      pointer?.send({ action: 'cancel' })
+      await runDisplayCommand(join(__dirname, 'tablet-pointer.exe'), [
+        '--orient-display', direction, String(x), String(y), String(x + width), String(y + height),
+      ], { windowsHide: true, timeout: 5000 })
+    }).catch(() => { console.warn('无法切换 VDD 虚拟副屏方向。') })
+  }
 
   async function stopShare() {
     if (stopping) return stopping
     captureEpoch++
+    orientationRequest++
     selected = capturing = undefined
     const oldPointer = pointer
     pointer = undefined
     const previous = share
     share = undefined
-    stopping = Promise.all([oldPointer?.close(), previous?.stop(), starting?.catch(() => undefined)])
+    stopping = Promise.all([oldPointer?.close(), previous?.stop(), starting?.catch(() => undefined), rotation])
       .then(() => { stopping = undefined })
     await stopping
   }
@@ -133,6 +154,7 @@ async function openWindow() {
         role,
         name: `${display?.label || `屏幕 ${index + 1}`}${roleLabels[role]}`,
         thumbnail: source.thumbnail.isEmpty() ? '' : source.thumbnail.toDataURL(),
+        canRotate: process.platform === 'win32' && role === 'extension' && display?.label === 'VDD by MTT',
       }
     })
   })
@@ -148,7 +170,7 @@ async function openWindow() {
     }
     selected = { source, mode }
   })
-  handle('start-share', async (address, control) => {
+  handle('start-share', async (address, control, orientationMode) => {
     if (starting || share || stopping) throw new Error('已有一个共享会话，或上一会话尚在结束。')
     const capture = capturing
     if (!capture || !captureIsAvailable(capture)) throw new Error('所选屏幕已断开。')
@@ -158,8 +180,10 @@ async function openWindow() {
     if (!networks().some((network) => network.address === address)) {
       throw new Error('所选局域网地址已变化。请刷新设备后重试。')
     }
+    const followOrientation = orientationMode === 'follow' && capture.mode === 'extension' && process.platform === 'win32' &&
+      screen.getAllDisplays().some(({ id, label }) => String(id) === capture.source.display_id && label === 'VDD by MTT')
     const startup = (async () => {
-      const server = await startLanServer(address, __dirname)
+      const server = await startLanServer(address, __dirname, followOrientation ? (direction) => orientSharedVdd(capture, direction) : undefined)
       let sessionPointer: typeof pointer
       try {
         if (control === 'touch') {
@@ -200,7 +224,7 @@ async function openWindow() {
     if (text === share?.viewerUrl) clipboard.writeText(text)
   })
   app.on('before-quit', (event) => {
-    if (!pointer && !stopping && !starting) return
+    if (!share && !pointer && !stopping && !starting) return
     event.preventDefault()
     void stopShare().then(() => app.quit())
   })
@@ -215,8 +239,18 @@ async function openWindow() {
   await window.loadFile(join(__dirname, 'host.html'))
 }
 
-app.whenReady().then(openWindow).catch((error: unknown) => {
-  console.error(error)
+if (!app.requestSingleInstanceLock()) {
   app.quit()
-})
-app.on('window-all-closed', () => app.quit())
+} else {
+  app.on('second-instance', () => {
+    const window = BrowserWindow.getAllWindows()[0]
+    if (!window) return
+    if (window.isMinimized()) window.restore()
+    window.focus()
+  })
+  app.whenReady().then(openWindow).catch((error: unknown) => {
+    console.error(error)
+    app.quit()
+  })
+  app.on('window-all-closed', () => app.quit())
+}

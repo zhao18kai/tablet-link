@@ -158,9 +158,14 @@ internal static class TabletPointer
         lastInput = Stopwatch.GetTimestamp();
     }
 
-    private static void Main()
+    private static void Main(string[] args)
     {
         SetThreadDpiAwarenessContext(new IntPtr(-4)); // Per-monitor DPI aware v2
+        if (args.Length != 0)
+        {
+            Environment.ExitCode = VirtualDisplay.Rotate(args);
+            return;
+        }
         using (var watchdog = new Timer(_ =>
         {
             lock (Gate)

@@ -9,12 +9,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 import WebSocket from 'ws'
 import { startLanServer } from '../src/lan.ts'
 
-async function setup(t: test.TestContext) {
+async function setup(t: test.TestContext, onOrientation?: (orientation: string) => void) {
   const dir = await mkdtemp(join(tmpdir(), 'tablet-link-test-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   await writeFile(join(dir, 'watch.html'), '<title>Receiver</title>')
   await writeFile(join(dir, 'private.txt'), 'not public')
-  const server = await startLanServer('127.0.0.1', dir)
+  const server = await startLanServer('127.0.0.1', dir, onOrientation)
   t.after(() => server.stop())
   const viewerUrl = new URL(server.viewerUrl)
   const viewerWs = new URL('/viewer', viewerUrl)
@@ -134,6 +134,40 @@ test('rejecting a viewer releases its slot for a fresh request', async (t) => {
   assert.equal((await refused).type, 'rejected')
   await closed
   await connect(viewerWs, viewerUrl.origin).opened
+})
+
+test('rotation follows the most recent valid direction from an approved viewer', { timeout: 4000 }, async (t) => {
+  const applied: string[] = []
+  let resolveRotation!: () => void
+  const rotated = new Promise<void>((resolve) => { resolveRotation = resolve })
+  const { server, viewerUrl, viewerWs } = await setup(t, (orientation) => {
+    applied.push(orientation)
+    resolveRotation()
+  })
+  const host = connect(server.hostUrl, 'null')
+  await host.opened
+  const request = receive(host.socket)
+  const viewer = connect(viewerWs, viewerUrl.origin)
+  await viewer.opened
+  const { id } = await request
+  const orientation = (direction: string, session = id) => JSON.stringify({ type: 'orientation', id: session, direction })
+  viewer.socket.send(orientation('portrait'))
+  const received = once(viewer.socket, 'pong')
+  viewer.socket.ping()
+  await received
+  const approved = receive(viewer.socket)
+  host.socket.send(JSON.stringify({ type: 'approve', id }))
+  assert.equal((await approved).followOrientation, true)
+  await delay(200)
+  assert.deepEqual(applied, [])
+
+  viewer.socket.send(orientation('portrait'))
+  viewer.socket.send(orientation('landscape'))
+  viewer.socket.send(orientation('portrait', 'old-session'))
+  viewer.socket.send(orientation('arbitrary-mode'))
+  host.socket.send(orientation('portrait'))
+  await rotated
+  assert.deepEqual(applied, ['landscape'])
 })
 
 test('approval for a departed viewer cannot approve the next viewer', async (t) => {

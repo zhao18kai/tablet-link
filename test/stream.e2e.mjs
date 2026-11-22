@@ -237,6 +237,21 @@ async function streamScreen(t, extension = false) {
   }
   t.diagnostic('The same approved viewer reconnected automatically and stayed fullscreen')
 
+  await viewer.evaluate(() => {
+    const socket = window.testSignalingSocket
+    const close = socket.close.bind(socket)
+    socket.close = (code, reason) => {
+      if (code === 4001) window.setTimeout(() => close(code, reason), 420)
+      else close(code, reason)
+    }
+    document.querySelector('#leave').click()
+    document.querySelector('#connect').click()
+  })
+  await approve.waitFor({ state: 'visible', timeout: 6000 })
+  await approve.click()
+  await viewer.waitForFunction(() => document.querySelector('#viewer-prompt').hidden, undefined, { timeout: 12000 })
+  t.diagnostic('A manual reconnect waits for the previous socket to close and requests approval again')
+
   await host.getByRole('button', { name: '停止共享' }).click()
   await viewer.waitForFunction(() => document.querySelector('video').srcObject === null)
   await viewer.waitForFunction(() => document.fullscreenElement === null)

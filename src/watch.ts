@@ -1,5 +1,6 @@
 import { createPeer, transmit } from './peer.ts'
 import { createViewerPointer } from './watch-pointer.ts'
+import { createRotationTransition } from './watch-rotation.ts'
 import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type Signal } from './wire.ts'
 
 const token = location.hash.slice(1)
@@ -15,15 +16,27 @@ const prompt = document.querySelector<HTMLElement>('#viewer-prompt')!
 const stats = document.querySelector<HTMLElement>('#stats')!
 const touchHint = document.querySelector<HTMLElement>('#touch-hint')!
 const video = document.querySelector<HTMLVideoElement>('video')!
+const portraitViewport = window.matchMedia('(orientation: portrait)')
 let channel: WebSocket | undefined
 let activePeer: ReturnType<typeof createPeer> | undefined
 let timer: number | undefined
 let interruptedTimer: number | undefined
+let disconnecting: Promise<void> | undefined
 let resumeToken: string | undefined
 let retryDeadline = 0
 let retryCount = 0
 let touchChannel: RTCDataChannel | undefined
 let touchEnabled = false
+let followOrientation = false
+
+function reportOrientation() {
+  if (!followOrientation || !channel || !activePeer) return
+  const direction = portraitViewport.matches ? 'portrait' : 'landscape'
+  transmit(channel, { type: 'orientation', id: activePeer.id, direction })
+  rotation.start(direction)
+}
+
+portraitViewport.addEventListener('change', reportOrientation)
 
 const remotePointer = createViewerPointer(video.parentElement!, video, (command) => {
   if (touchChannel?.readyState !== 'open') return
@@ -31,6 +44,9 @@ const remotePointer = createViewerPointer(video.parentElement!, video, (command)
   touchChannel.send(JSON.stringify(command))
 }, () => {
   if (document.fullscreenElement === stage) setControlsVisible(toolbar.hidden === true)
+})
+const rotation = createRotationTransition(video, document.querySelector<HTMLCanvasElement>('#rotation-frame')!, (waiting) => {
+  remotePointer.setEnabled(touchEnabled && !waiting && !!channel)
 })
 
 function setControlsVisible(visible: boolean) {
@@ -54,7 +70,7 @@ function updateFullscreen() {
 
 function updateTouchMode() {
   touchEnabled = activePeer?.pc.connectionState === 'connected' && touchChannel?.readyState === 'open' && prompt.hidden === true
-  remotePointer.setEnabled(touchEnabled)
+  remotePointer.setEnabled(touchEnabled && !rotation.waiting)
   touchHint.hidden = !touchEnabled
   updateFullscreen()
 }
@@ -62,6 +78,11 @@ function updateTouchMode() {
 function resetConnection(closeCode?: number) {
   const previous = channel
   channel = undefined
+  disconnecting = closeCode === VIEWER_LEAVING && previous && previous.readyState !== WebSocket.CLOSED
+    ? waitForDisconnect(previous)
+    : undefined
+  followOrientation = false
+  rotation.clear()
   remotePointer.setEnabled(false)
   touchChannel = undefined
   activePeer?.pc.close()
@@ -76,6 +97,30 @@ function resetConnection(closeCode?: number) {
   prompt.hidden = false
   fit.hidden = true
   updateTouchMode()
+}
+
+function waitForDisconnect(socket: WebSocket) {
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      window.clearTimeout(deadline)
+      socket.removeEventListener('close', finish)
+      resolve()
+    }
+    const deadline = window.setTimeout(finish, 2000)
+    socket.addEventListener('close', finish, { once: true })
+  })
+}
+
+async function requestConnection() {
+  const pending = disconnecting
+  if (pending) {
+    button.disabled = true
+    status.textContent = '正在结束上一连接…'
+    await pending
+    if (disconnecting !== pending) return
+    disconnecting = undefined
+  }
+  connect()
 }
 
 function end(message: string, closeCode?: number) {
@@ -152,9 +197,11 @@ function connect(resuming = false) {
   })
   socket.addEventListener('close', ({ code }) => {
     if (channel !== socket) return
-    if (code === SHARE_ENDED) end('电脑已停止共享。')
-    else if (code === VIEWER_REPLACED) end('共享已在另一连接中恢复。')
-    else connectionLost(opened ? '共享已断开。' : '无法连接。请确认电脑仍在共享，且两台设备在同一网络。')
+    if (code === SHARE_ENDED) {
+      end('电脑已停止共享。请用电脑上的新二维码重新配对。')
+      button.hidden = true
+    } else if (code === VIEWER_REPLACED) end('共享已在另一连接中恢复。')
+    else connectionLost(opened ? '共享已断开。' : '无法连接。请确认两台设备在同一网络。电脑重新开始共享后，请扫新二维码。')
   })
 
   let queue = Promise.resolve()
@@ -172,6 +219,8 @@ function connect(resuming = false) {
         timer = window.setTimeout(() => connectionLost('已连接电脑，但未收到画面。请重试。'), firstFrameTimeout)
         const peer = createPeer(message.id, (signal) => transmit(socket, signal))
         activePeer = peer
+        followOrientation = message.followOrientation === true
+        reportOrientation()
         peer.pc.onconnectionstatechange = () => {
           if (activePeer !== peer) return
           window.clearTimeout(interruptedTimer)
@@ -274,4 +323,4 @@ window.addEventListener('pagehide', () => {
 if (!/^[\w-]{32}$/.test(token) || typeof RTCPeerConnection !== 'function') {
   button.hidden = true
   status.textContent = token ? '浏览器不支持该连接，或链接已失效。' : '请用电脑端生成的二维码或完整链接打开。'
-} else button.addEventListener('click', () => connect())
+} else button.addEventListener('click', () => void requestConnection())

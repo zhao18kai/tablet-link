@@ -5,10 +5,11 @@ import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
-import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type Signal } from './wire.ts'
+import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type DisplayOrientation, type Signal } from './wire.ts'
 
 const resumeGraceMs = 60_000
 const closeGraceMs = 1_000
+const orientationSettleMs = 100
 
 type Viewer = { socket: WebSocket; id: string }
 type ResumeGrant = { token: string; id: string; expiresAt?: number }
@@ -43,13 +44,16 @@ function readSignal(text: string): Signal | undefined {
       case 'ice':
         if (typeof message.candidate?.candidate === 'string') return message
         break
+      case 'orientation':
+        if (message.direction === 'portrait' || message.direction === 'landscape') return message
+        break
     }
   } catch {
     return undefined
   }
 }
 
-export async function startLanServer(address: string, directory: string) {
+export async function startLanServer(address: string, directory: string, onOrientation?: (direction: DisplayOrientation) => void) {
   const hostToken = randomBytes(24).toString('base64url')
   const viewerToken = randomBytes(24).toString('base64url')
   const websocket = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 })
@@ -89,7 +93,7 @@ export async function startLanServer(address: string, directory: string) {
 
   function approveViewer(current: Viewer, resumeToken: string) {
     resumeGrant = { token: resumeToken, id: current.id }
-    send(current.socket, { type: 'approved', id: current.id, resumeToken })
+    send(current.socket, { type: 'approved', id: current.id, resumeToken, ...(onOrientation && { followOrientation: true as const }) })
     send(host, { type: 'approved', id: current.id })
   }
 
@@ -120,6 +124,7 @@ export async function startLanServer(address: string, directory: string) {
       return
     }
     websocket.handleUpgrade(request, networkSocket, head, (socket) => {
+      let orientationTimer: ReturnType<typeof setTimeout> | undefined
       if (asHost) host = socket
       else {
         const previous = viewer?.socket
@@ -135,6 +140,7 @@ export async function startLanServer(address: string, directory: string) {
       socket.on('pong', () => awaitingPong.delete(socket))
       socket.on('error', () => socket.terminate())
       socket.on('close', (code) => {
+        clearTimeout(orientationTimer)
         awaitingPong.delete(socket)
         if (host === socket) {
           host = undefined
@@ -166,6 +172,12 @@ export async function startLanServer(address: string, directory: string) {
         } else if (approved) {
           if (socket === host && (message.type === 'offer' || message.type === 'ice')) send(current.socket, message)
           if (socket === current.socket && (message.type === 'answer' || message.type === 'ice')) send(host, message)
+          if (socket === current.socket && message.type === 'orientation' && onOrientation) {
+            clearTimeout(orientationTimer)
+            orientationTimer = setTimeout(() => {
+              if (!stopped && viewer === current && resumeGrant?.id === current.id) onOrientation(message.direction)
+            }, orientationSettleMs)
+          }
         }
       })
     })

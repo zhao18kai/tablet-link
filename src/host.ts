@@ -13,6 +13,8 @@ const modes = document.querySelector<HTMLFieldSetElement>('#modes')!
 const extension = document.querySelector<HTMLInputElement>('#mode-extension')!
 const touchOption = document.querySelector<HTMLLabelElement>('#touch-option')!
 const touch = document.querySelector<HTMLInputElement>('#allow-touch')!
+const orientationOption = document.querySelector<HTMLLabelElement>('#orientation-option')!
+const orientation = document.querySelector<HTMLInputElement>('#follow-orientation')!
 const displaySettings = document.querySelector<HTMLButtonElement>('#display-settings')!
 const displayHint = document.querySelector<HTMLElement>('#display-hint')!
 const source = document.querySelector<HTMLSelectElement>('#source')!
@@ -53,6 +55,8 @@ function updateControls() {
   modes.disabled = displaySettings.disabled = source.disabled = network.disabled = refresh.disabled = busy || sharing
   touchOption.hidden = !extension.checked
   touch.disabled = busy || sharing || !extension.checked
+  orientationOption.hidden = !extension.checked || !sourceChoice?.canRotate
+  orientation.disabled = busy || sharing || orientationOption.hidden
   start.hidden = sharing
   start.disabled = busy || !source.value || !network.value
   stop.hidden = !sharing
@@ -236,6 +240,7 @@ async function beginShare() {
   if (!selected) return
   const run = ++captureRun
   const allowTouch = extension.checked && touch.checked
+  const followOrientation = extension.checked && selected.canRotate && orientation.checked
   busy = true
   updateControls()
   setStatus('正在启动屏幕共享…', 'pending')
@@ -243,7 +248,7 @@ async function beginShare() {
     await api.selectSource(selected.id, selected.displayId, extension.checked ? 'extension' : 'screen')
     if (captureRun !== run) return
     const media = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: { max: 1920 }, height: { max: 1250 }, frameRate: { ideal: 60, max: 60 } },
+      video: { width: { max: 1920 }, height: { max: followOrientation ? 1920 : 1250 }, frameRate: { ideal: 60, max: 60 } },
       audio: false,
     })
     if (captureRun !== run) {
@@ -257,7 +262,7 @@ async function beginShare() {
     track.addEventListener('ended', () => {
       if (captureRun === run) void endShare('所选屏幕已停止捕获。', 'error')
     }, { once: true })
-    const share = await api.start(network.value, allowTouch)
+    const share = await api.start(network.value, allowTouch, followOrientation)
     if (captureRun !== run) return
     const channel = new WebSocket(share.hostUrl)
     socket = channel
