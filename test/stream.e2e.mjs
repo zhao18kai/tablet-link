@@ -30,7 +30,7 @@ async function streamScreen(t, extension = false) {
   })
   const browser = await chromium.launch({ executablePath: edge })
   t.after(() => browser.close())
-  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 } })
+  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 }, hasTouch: true })
 
   await host.locator('#network').selectOption(address)
   if (extension) {
@@ -95,6 +95,19 @@ async function streamScreen(t, extension = false) {
 
   await viewer.getByRole('button', { name: '全屏', exact: true }).click()
   await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
+  await viewer.locator('.viewer-bar').waitFor({ state: 'hidden', timeout: 3000 })
+  const fit = viewer.getByRole('button', { name: '铺满画面（裁边）' })
+  const surface = viewer.getByRole('button', { name: '显示全屏控件' })
+  await surface.tap()
+  assert.equal(await fit.getAttribute('aria-pressed'), 'false')
+  assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
+  await fit.tap()
+  assert.equal(await fit.getAttribute('aria-pressed'), 'true')
+  assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'cover')
+  await fit.tap()
+  assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
+  await viewer.getByRole('button', { name: '隐藏全屏控件' }).tap()
+  await viewer.locator('.viewer-bar').waitFor({ state: 'hidden' })
 
   await host.getByRole('button', { name: '停止共享' }).click()
   await viewer.waitForFunction(() => document.querySelector('video').srcObject === null)

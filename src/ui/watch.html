@@ -9,16 +9,18 @@
 </head>
 <body class="viewer">
   <main id="stage" class="stage">
-    <header class="viewer-bar">
+    <header id="viewer-bar" class="viewer-bar">
       <h1>平板智联</h1>
       <div class="viewer-actions">
         <span id="stats" aria-label="接收画面参数"></span>
+        <button class="quiet" id="fit" type="button" aria-pressed="false" hidden>铺满画面（裁边）</button>
         <button class="quiet" id="fullscreen" type="button" disabled>全屏</button>
         <button class="quiet" id="leave" type="button" disabled>断开</button>
       </div>
     </header>
     <div class="screen">
       <video autoplay muted playsinline aria-label="来自 Windows 电脑的屏幕画面"></video>
+      <button id="viewer-surface" type="button" aria-label="显示全屏控件" aria-controls="viewer-bar" aria-expanded="false" hidden></button>
       <div class="viewer-prompt" id="viewer-prompt">
         <p id="status" role="status">发起请求后，请在电脑上允许连接。</p>
         <button id="connect" class="primary" type="button">请求观看</button>

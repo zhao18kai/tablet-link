@@ -4,8 +4,11 @@ import type { Signal } from './wire.ts'
 const token = location.hash.slice(1)
 const button = document.querySelector<HTMLButtonElement>('#connect')!
 const full = document.querySelector<HTMLButtonElement>('#fullscreen')!
+const fit = document.querySelector<HTMLButtonElement>('#fit')!
 const leave = document.querySelector<HTMLButtonElement>('#leave')!
 const stage = document.querySelector<HTMLElement>('#stage')!
+const toolbar = document.querySelector<HTMLElement>('#viewer-bar')!
+const surface = document.querySelector<HTMLButtonElement>('#viewer-surface')!
 const status = document.querySelector<HTMLElement>('#status')!
 const prompt = document.querySelector<HTMLElement>('#viewer-prompt')!
 const stats = document.querySelector<HTMLElement>('#stats')!
@@ -13,6 +16,24 @@ const video = document.querySelector<HTMLVideoElement>('video')!
 let channel: WebSocket | undefined
 let activePeer: ReturnType<typeof createPeer> | undefined
 let timer: number | undefined
+
+function setControlsVisible(visible: boolean) {
+  toolbar.hidden = !visible
+  surface.setAttribute('aria-expanded', String(visible))
+  surface.setAttribute('aria-label', visible ? '隐藏全屏控件' : '显示全屏控件')
+}
+
+function updateFullscreen() {
+  const fullscreen = document.fullscreenElement === stage
+  const keyboardEntry = document.activeElement === full && full.matches(':focus-visible')
+  const restoreFocus = document.activeElement === surface
+  surface.hidden = !fullscreen || !prompt.hidden
+  setControlsVisible(surface.hidden)
+  full.textContent = fullscreen ? '退出全屏' : '全屏'
+  full.disabled = !fullscreen && (!activePeer || !prompt.hidden || !document.fullscreenEnabled)
+  if (!surface.hidden && keyboardEntry) surface.focus()
+  else if (!fullscreen && restoreFocus && !full.disabled) full.focus()
+}
 
 function end(message: string) {
   const previous = channel
@@ -29,8 +50,9 @@ function end(message: string) {
   button.hidden = false
   button.disabled = false
   button.textContent = '重新连接'
-  full.disabled = document.fullscreenElement !== stage
+  fit.hidden = true
   leave.disabled = true
+  updateFullscreen()
 }
 
 async function play() {
@@ -107,8 +129,10 @@ function connect() {
 video.addEventListener('playing', () => {
   if (!activePeer) return
   window.clearTimeout(timer)
+  const firstPlayback = !prompt.hidden
   prompt.hidden = true
-  full.disabled = !stage.requestFullscreen
+  fit.hidden = false
+  if (firstPlayback) updateFullscreen()
 })
 
 let sample: { decoded: number; time: number } | undefined
@@ -132,16 +156,17 @@ window.setInterval(async () => {
 
 full.addEventListener('click', async () => {
   try {
-    if (document.fullscreenElement) await document.exitFullscreen()
-    else await stage.requestFullscreen()
+    if (document.fullscreenElement === stage) await document.exitFullscreen()
+    else await stage.requestFullscreen({ navigationUI: 'hide' })
   } catch {
     stats.textContent = '当前浏览器无法进入全屏'
     full.disabled = true
   }
 })
-document.addEventListener('fullscreenchange', () => {
-  full.textContent = document.fullscreenElement ? '退出全屏' : '全屏'
-  full.disabled = !document.fullscreenElement && (!activePeer || !prompt.hidden)
+document.addEventListener('fullscreenchange', updateFullscreen)
+surface.addEventListener('click', () => setControlsVisible(toolbar.hidden === true))
+fit.addEventListener('click', () => {
+  fit.setAttribute('aria-pressed', String(video.classList.toggle('video-cover')))
 })
 leave.addEventListener('click', () => void end('已断开连接。'))
 window.addEventListener('pagehide', () => {
