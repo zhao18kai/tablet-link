@@ -1,16 +1,22 @@
 type Point = { x: number; y: number }
 
-export type PointerCommand = ({ action: 'down' | 'move' | 'up' } & Point) | { action: 'cancel' }
+export const maxPointerWheelDelta = 480
+
+export type PointerCommand =
+  | ({ action: 'down' | 'move' | 'up' } & Point)
+  | ({ action: 'wheel'; delta: number } & Point)
+  | { action: 'cancel' }
 
 export function parsePointerCommand(raw: unknown): PointerCommand | undefined {
   if (typeof raw !== 'string' || raw.length > 160) return
   try {
-    const value = JSON.parse(raw) as { action?: string; x?: number; y?: number } | null
-    if (value?.action === 'cancel') return { action: 'cancel' }
-    if (value?.action !== 'down' && value?.action !== 'move' && value?.action !== 'up') return
-    const { x, y, action } = value
-    if (typeof x === 'number' && x >= 0 && x <= 1 && typeof y === 'number' && y >= 0 && y <= 1) {
-      return { action, x, y }
+    const { action, x, y, delta } = JSON.parse(raw) as { action?: string; x?: number; y?: number; delta?: number }
+    if (action === 'cancel') return { action }
+    if (typeof x !== 'number' || !(x >= 0 && x <= 1) || typeof y !== 'number' || !(y >= 0 && y <= 1)) return
+    if (action === 'down' || action === 'move' || action === 'up') return { action, x, y }
+    if (action === 'wheel' && typeof delta === 'number' && Number.isInteger(delta) &&
+        delta !== 0 && Math.abs(delta) <= maxPointerWheelDelta) {
+      return { action, x, y, delta }
     }
   } catch {
     // Invalid messages do not reach the Windows input process.

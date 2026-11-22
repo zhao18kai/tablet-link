@@ -1,6 +1,6 @@
 import { createPeer, transmit } from './peer.ts'
 import { createViewerPointer } from './watch-pointer.ts'
-import type { Signal } from './wire.ts'
+import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type Signal } from './wire.ts'
 
 const token = location.hash.slice(1)
 const button = document.querySelector<HTMLButtonElement>('#connect')!
@@ -18,12 +18,16 @@ const video = document.querySelector<HTMLVideoElement>('video')!
 let channel: WebSocket | undefined
 let activePeer: ReturnType<typeof createPeer> | undefined
 let timer: number | undefined
+let interruptedTimer: number | undefined
+let resumeToken: string | undefined
+let retryDeadline = 0
+let retryCount = 0
 let touchChannel: RTCDataChannel | undefined
 let touchEnabled = false
 
 const remotePointer = createViewerPointer(video.parentElement!, video, (command) => {
   if (touchChannel?.readyState !== 'open') return
-  if (command.action === 'move' && touchChannel.bufferedAmount > 4096) return
+  if ((command.action === 'move' || command.action === 'wheel') && touchChannel.bufferedAmount > 4096) return
   touchChannel.send(JSON.stringify(command))
 }, () => {
   if (document.fullscreenElement === stage) setControlsVisible(toolbar.hidden === true)
@@ -55,33 +59,63 @@ function updateTouchMode() {
   updateFullscreen()
 }
 
-function end(message: string) {
+function resetConnection(closeCode?: number) {
   const previous = channel
   channel = undefined
-  previous?.close()
   remotePointer.setEnabled(false)
   touchChannel = undefined
   activePeer?.pc.close()
   activePeer = undefined
+  previous?.close(closeCode)
   window.clearTimeout(timer)
+  window.clearTimeout(interruptedTimer)
+  interruptedTimer = undefined
   video.srcObject = null
-  if (document.fullscreenElement === stage) void document.exitFullscreen().catch(() => {})
-  status.textContent = message
   stats.textContent = ''
+  sample = undefined
   prompt.hidden = false
-  button.hidden = false
-  button.disabled = false
-  button.textContent = '重新连接'
   fit.hidden = true
-  leave.disabled = true
   updateTouchMode()
 }
 
+function end(message: string, closeCode?: number) {
+  resetConnection(closeCode)
+  resumeToken = undefined
+  retryDeadline = 0
+  retryCount = 0
+  if (document.fullscreenElement === stage) void document.exitFullscreen().catch(() => {})
+  status.textContent = message
+  button.hidden = false
+  button.disabled = false
+  button.textContent = '重新连接'
+  leave.disabled = true
+}
+
+function connectionLost(message: string) {
+  if (!resumeToken) {
+    end(message)
+    return
+  }
+  retryDeadline ||= Date.now() + 30000
+  const backoff = Math.min(500 * 2 ** retryCount, 4000)
+  if (Date.now() + backoff >= retryDeadline) {
+    end('自动重连超时，请点击重新连接。')
+    return
+  }
+  resetConnection()
+  status.textContent = '连接中断，正在自动重连…'
+  button.hidden = true
+  leave.disabled = false
+  retryCount++
+  timer = window.setTimeout(() => connect(true), backoff)
+}
+
 async function play() {
+  const peer = activePeer
   try {
     await video.play()
   } catch {
-    if (!activePeer) return
+    if (!peer || peer !== activePeer) return
     window.clearTimeout(timer)
     button.disabled = false
     button.hidden = false
@@ -90,7 +124,7 @@ async function play() {
   }
 }
 
-function connect() {
+function connect(resuming = false) {
   if (activePeer && video.srcObject) {
     void play()
     return
@@ -98,23 +132,29 @@ function connect() {
   const endpoint = new URL('/viewer', location.href)
   endpoint.protocol = 'ws:'
   endpoint.searchParams.set('token', token)
+  if (resuming && resumeToken) endpoint.searchParams.set('resume', resumeToken)
   const socket = new WebSocket(endpoint)
+  let opened = false
   channel = socket
   button.disabled = false
   button.hidden = true
   leave.disabled = false
-  status.textContent = '正在连接电脑…'
-  timer = window.setTimeout(() => end('连接超时。请确认电脑仍在共享。'), 10000)
+  status.textContent = resuming ? '正在自动重连…' : '正在连接电脑…'
+  const timeout = resuming ? Math.min(6000, Math.max(0, retryDeadline - Date.now())) : 10000
+  timer = window.setTimeout(() => connectionLost('连接超时。请确认电脑仍在共享。'), timeout)
   socket.addEventListener('open', () => {
     if (channel !== socket) return
-    window.clearTimeout(timer)
-    status.textContent = '请在电脑端允许连接。'
+    opened = true
+    if (!resuming) {
+      window.clearTimeout(timer)
+      status.textContent = '请在电脑端允许连接。'
+    }
   })
-  socket.addEventListener('error', () => {
-    if (channel === socket) end('无法连接。请确认电脑仍在共享、在同一网络且没有其他平板占用。')
-  })
-  socket.addEventListener('close', () => {
-    if (channel === socket) end('共享已断开。')
+  socket.addEventListener('close', ({ code }) => {
+    if (channel !== socket) return
+    if (code === SHARE_ENDED) end('电脑已停止共享。')
+    else if (code === VIEWER_REPLACED) end('共享已在另一连接中恢复。')
+    else connectionLost(opened ? '共享已断开。' : '无法连接。请确认电脑仍在共享，且两台设备在同一网络。')
   })
 
   let queue = Promise.resolve()
@@ -125,14 +165,26 @@ function connect() {
       if (message.type === 'rejected') {
         end('电脑取消了本次连接。')
       } else if (message.type === 'approved') {
+        window.clearTimeout(timer)
+        resumeToken = message.resumeToken
         status.textContent = '正在等候第一帧画面…'
-        timer = window.setTimeout(() => end('已连接电脑，但未收到画面。请重试。'), 20000)
+        const firstFrameTimeout = resuming ? Math.min(10000, Math.max(0, retryDeadline - Date.now())) : 20000
+        timer = window.setTimeout(() => connectionLost('已连接电脑，但未收到画面。请重试。'), firstFrameTimeout)
         const peer = createPeer(message.id, (signal) => transmit(socket, signal))
         activePeer = peer
         peer.pc.onconnectionstatechange = () => {
           if (activePeer !== peer) return
-          if (peer.pc.connectionState === 'failed') end('视频连接失败，请重新连接。')
-          else if (touchChannel) updateTouchMode()
+          window.clearTimeout(interruptedTimer)
+          interruptedTimer = undefined
+          if (peer.pc.connectionState === 'failed') connectionLost('视频连接失败，请重新连接。')
+          else {
+            if (peer.pc.connectionState === 'disconnected') {
+              interruptedTimer = window.setTimeout(() => {
+                if (activePeer === peer) connectionLost('视频连接已中断。')
+              }, 2000)
+            }
+            if (touchChannel) updateTouchMode()
+          }
         }
         peer.pc.ondatachannel = ({ channel: controls }) => {
           if (activePeer !== peer || controls.label !== 'tablet-link-pointer' || touchChannel) {
@@ -165,14 +217,16 @@ function connect() {
         if (message.type === 'offer' && activePeer === peer) await peer.publish('answer')
       }
     }).catch(() => {
-      if (channel === socket) end('视频协商失败，请重新连接。')
+      if (channel === socket) connectionLost('视频协商失败，请重新连接。')
     })
   })
 }
 
 video.addEventListener('playing', () => {
-  if (!activePeer) return
+  if (!activePeer || !video.srcObject) return
   window.clearTimeout(timer)
+  retryDeadline = 0
+  retryCount = 0
   const firstPlayback = !prompt.hidden
   prompt.hidden = true
   fit.hidden = false
@@ -212,7 +266,7 @@ surface.addEventListener('click', () => setControlsVisible(toolbar.hidden === tr
 fit.addEventListener('click', () => {
   fit.setAttribute('aria-pressed', String(video.classList.toggle('video-cover')))
 })
-leave.addEventListener('click', () => void end('已断开连接。'))
+leave.addEventListener('click', () => end('已断开连接。', VIEWER_LEAVING))
 window.addEventListener('pagehide', () => {
   if (channel) end('已断开连接。')
 })
@@ -220,4 +274,4 @@ window.addEventListener('pagehide', () => {
 if (!/^[\w-]{32}$/.test(token) || typeof RTCPeerConnection !== 'function') {
   button.hidden = true
   status.textContent = token ? '浏览器不支持该连接，或链接已失效。' : '请用电脑端生成的二维码或完整链接打开。'
-} else button.addEventListener('click', connect)
+} else button.addEventListener('click', () => connect())

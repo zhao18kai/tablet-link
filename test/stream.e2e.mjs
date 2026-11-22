@@ -26,11 +26,20 @@ async function streamScreen(t, extension = false) {
   t.after(() => app.close())
   const host = await app.firstWindow()
   host.on('console', (message) => {
-    if (message.type() === 'error') t.diagnostic(message.text().replace(/token=[\w-]+/g, 'token=[redacted]'))
+    if (message.type() === 'error') t.diagnostic(message.text().replace(/(token|resume)=[\w-]+/g, '$1=[redacted]'))
   })
   const browser = await chromium.launch({ executablePath: edge })
   t.after(() => browser.close())
   const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 }, hasTouch: true })
+  await viewer.addInitScript(() => {
+    const Original = window.WebSocket
+    window.WebSocket = class extends Original {
+      constructor(url, protocols) {
+        super(url, protocols)
+        window.testSignalingSocket = this
+      }
+    }
+  })
   let markerPage
 
   await host.locator('#network').selectOption(address)
@@ -60,7 +69,7 @@ async function streamScreen(t, extension = false) {
       const targetPage = `<style>
           @keyframes sweep { from { transform: translateX(0) } to { transform: translateX(78vw) } }
           .moving { position: absolute; top: 27px; width: 90px; height: 65px; background: white; animation: sweep 1.8s linear infinite alternate; }
-        </style><body style="background:#2f93cb" data-clicks="0" data-drags="0" data-ups="0"><div class="moving"></div>
+        </style><body style="background:#2f93cb; min-height:180vh" data-clicks="0" data-drags="0" data-ups="0"><div class="moving"></div>
         <script>
           const count = (key) => { document.body.dataset[key] = Number(document.body.dataset[key]) + 1 }
           document.addEventListener('click', () => count('clicks'))
@@ -149,6 +158,38 @@ async function streamScreen(t, extension = false) {
   if (extension) await twoFingerTap(viewer)
   else await viewer.getByRole('button', { name: '隐藏全屏控件' }).tap()
   await viewer.locator('.viewer-bar').waitFor({ state: 'hidden' })
+
+  if (extension) {
+    const clicksBeforeScroll = await markerPage.locator('body').getAttribute('data-clicks')
+    const { x, y } = await videoCenter(viewer)
+    const touch = await viewer.context().newCDPSession(viewer)
+    const fingers = (dy) => [{ x, y: y + dy, id: 1 }, { x: x + 40, y: y + dy, id: 2 }]
+    try {
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: fingers(0) })
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: fingers(-100) })
+      await markerPage.waitForFunction(() => window.scrollY > 0, undefined, { timeout: 6000 })
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+    } finally {
+      await touch.detach()
+    }
+    assert.equal(await markerPage.locator('body').getAttribute('data-clicks'), clicksBeforeScroll)
+    assert.equal(await viewer.locator('.viewer-bar').isVisible(), false)
+    t.diagnostic('Two-finger scrolling moved the Windows window without clicking or revealing fullscreen controls')
+  }
+
+  await viewer.evaluate(() => {
+    window.testPreviousStream = document.querySelector('video').srcObject
+    window.testSignalingSocket.close(4300, 'test connection loss')
+  })
+  await viewer.waitForFunction(() => {
+    const video = document.querySelector('video')
+    return video.srcObject && video.srcObject !== window.testPreviousStream &&
+      document.querySelector('#viewer-prompt').hidden
+  }, undefined, { timeout: 12000 })
+  assert.equal(await viewer.evaluate(() => document.fullscreenElement?.id), 'stage')
+  assert.equal(await approve.isVisible(), false)
+  if (extension) await viewer.locator('.screen.touch-enabled').waitFor({ state: 'visible' })
+  t.diagnostic('The same approved viewer reconnected automatically and stayed fullscreen')
 
   await host.getByRole('button', { name: '停止共享' }).click()
   await viewer.waitForFunction(() => document.querySelector('video').srcObject === null)

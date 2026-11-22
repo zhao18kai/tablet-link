@@ -1,12 +1,19 @@
 import type { DisplayRole } from './displays.ts'
 
+export const SHARE_ENDED = 4000
+export const VIEWER_LEAVING = 4001
+export const VIEWER_REPLACED = 4002
+
 export type MediaSignal =
   | { type: 'offer' | 'answer'; description: RTCSessionDescriptionInit }
   | { type: 'ice'; candidate: RTCIceCandidateInit }
 
-export type Signal = (MediaSignal | {
-  type: 'viewer-request' | 'viewer-left' | 'approve' | 'reject' | 'approved' | 'rejected'
-}) & { id: string }
+export type Signal = (
+  | MediaSignal
+  | { type: 'viewer-request'; resumed?: boolean }
+  | { type: 'approved'; resumeToken?: string }
+  | { type: 'viewer-left' | 'approve' | 'reject' | 'rejected' }
+) & { id: string }
 
 export interface CaptureSource {
   id: string

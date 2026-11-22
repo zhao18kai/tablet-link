@@ -46,8 +46,11 @@ export async function openWindowsPointer(
         return
       }
       const { point, bounds } = destination
-      const message = `${command.action} ${point.x} ${point.y} ${bounds.x} ${bounds.y} ${bounds.x + bounds.width} ${bounds.y + bounds.height}`
-      if (command.action === 'move' && pending.at(-1)?.startsWith('move ')) pending[pending.length - 1] = message
+      const target = `${point.x} ${point.y} ${bounds.x} ${bounds.y} ${bounds.x + bounds.width} ${bounds.y + bounds.height}`
+      const message = command.action === 'wheel' ? `wheel ${target} ${command.delta}` : `${command.action} ${target}`
+      const replaceable = command.action === 'move' || command.action === 'wheel'
+      if (replaceable && pending.at(-1)?.startsWith(`${command.action} `)) pending[pending.length - 1] = message
+      else if (command.action === 'wheel' && pending.length >= 8) return
       else if (pending.length >= 8) cancel()
       else pending.push(message)
       flush()

@@ -29,6 +29,11 @@ internal static class TabletPointer
     private const uint LeftDown = 0x0002;
     private const uint LeftUp = 0x0004;
     private const uint MoveAbsoluteOnDesktop = 0x0001 | 0x4000 | 0x8000;
+    private const uint MouseWheelMessage = 0x020A;
+    private const uint RootAncestor = 2;
+    private const uint AbortIfHung = 0x0002;
+    private const uint ErrorOnExit = 0x0020;
+    private const int MaxWheelDelta = 480;
     private static readonly int InputSize = Marshal.SizeOf(typeof(Input));
     private static readonly object Gate = new object();
     private static bool held;
@@ -39,6 +44,19 @@ internal static class TabletPointer
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromPoint(Point point, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point point);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, UIntPtr wParam,
+        IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
 
     [DllImport("user32.dll")]
     private static extern bool GetClipCursor(out Rect rectangle);
@@ -63,19 +81,44 @@ internal static class TabletPointer
         return x >= rect.Left && x < rect.Right && y >= rect.Top && y < rect.Bottom;
     }
 
-    private static bool SendAt(int x, int y, Rect expected, uint flags)
+    private static IntPtr SharedMonitor(Point point, Rect expected)
     {
         var info = new MonitorInfo { Size = Marshal.SizeOf(typeof(MonitorInfo)) };
-        IntPtr monitor = MonitorFromPoint(new Point { X = x, Y = y }, 0);
-        Rect clipped;
+        IntPtr monitor = MonitorFromPoint(point, 0);
         if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info) || (info.Flags & 1) != 0 ||
-            !info.Monitor.Equals(expected) || !GetClipCursor(out clipped) || !Contains(clipped, x, y)) return false;
+            !info.Monitor.Equals(expected)) return IntPtr.Zero;
+        return monitor;
+    }
+
+    private static bool SendAt(int x, int y, Rect expected, uint flags)
+    {
+        Rect clipped;
+        if (SharedMonitor(new Point { X = x, Y = y }, expected) == IntPtr.Zero ||
+            !GetClipCursor(out clipped) || !Contains(clipped, x, y)) return false;
 
         int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
         int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
         if (width <= 0 || height <= 0 || x < left || y < top || x >= left + width || y >= top + height) return false;
         return SendMouse((int)((2L * (x - left) + 1) * 32768 / width),
             (int)((2L * (y - top) + 1) * 32768 / height), MoveAbsoluteOnDesktop | flags);
+    }
+
+    private static void SendWheel(int x, int y, Rect expected, int delta)
+    {
+        // WM_MOUSEWHEEL stores signed screen coordinates in two 16-bit fields.
+        if (x < short.MinValue || x > short.MaxValue || y < short.MinValue || y > short.MaxValue) return;
+        var point = new Point { X = x, Y = y };
+        IntPtr monitor = SharedMonitor(point, expected);
+        if (monitor == IntPtr.Zero) return;
+        IntPtr window = WindowFromPoint(point);
+        if (window == IntPtr.Zero || MonitorFromWindow(window, 0) != monitor) return;
+        IntPtr root = GetAncestor(window, RootAncestor);
+        if (root == IntPtr.Zero || MonitorFromWindow(root, 0) != monitor) return;
+
+        // Address the hit window directly. Global input can route wheel motion to the focused window.
+        UIntPtr result;
+        SendMessageTimeoutW(window, MouseWheelMessage, new UIntPtr(unchecked((uint)(delta << 16))),
+            new IntPtr((x & 0xffff) | (y << 16)), AbortIfHung | ErrorOnExit, 50, out result);
     }
 
     private static void Release()
@@ -87,14 +130,22 @@ internal static class TabletPointer
     {
         if (line == "cancel") { Release(); return; }
         string[] parts = line.Split(' ');
-        if (parts.Length != 7) return;
-        var values = new int[6];
+        bool wheel = parts[0] == "wheel";
+        if (parts.Length != (wheel ? 8 : 7)) return;
+        var values = new int[parts.Length - 1];
         for (int i = 0; i < values.Length; i++)
         {
             if (!int.TryParse(parts[i + 1], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out values[i])) return;
         }
         int x = values[0], y = values[1];
         var bounds = new Rect { Left = values[2], Top = values[3], Right = values[4], Bottom = values[5] };
+        if (wheel)
+        {
+            int delta = values[6];
+            if (!held && delta != 0 && delta >= -MaxWheelDelta && delta <= MaxWheelDelta)
+                SendWheel(x, y, bounds, delta);
+            return;
+        }
         if (!Contains(bounds, x, y)) { Release(); return; }
 
         if (parts[0] == "down" && !held) held = SendAt(x, y, bounds, LeftDown);

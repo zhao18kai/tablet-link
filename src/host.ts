@@ -165,9 +165,9 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
       const message = JSON.parse(data) as Signal
       if (message.type === 'viewer-request') {
         requestId = message.id
-        request.hidden = false
+        request.hidden = message.resumed === true
         approve.disabled = reject.disabled = false
-        setStatus('平板正在请求观看', 'pending')
+        setStatus(message.resumed ? '正在恢复平板连接…' : '平板正在请求观看', 'pending')
       } else if (message.id !== requestId) {
         return
       } else if (message.type === 'viewer-left') {
@@ -187,7 +187,10 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
             if (allowTouch) api.remotePointer('{"action":"cancel"}')
             setStatus('连接暂时中断，等待恢复', 'pending')
           }
-          if (active.pc.connectionState === 'failed') fail(active.id)
+          if (active.pc.connectionState === 'failed') {
+            closePeer()
+            setStatus('视频连接中断，等待平板重连', 'pending')
+          }
         }
         active.pc.addTrack(media.getVideoTracks()[0], media)
         if (allowTouch) {
