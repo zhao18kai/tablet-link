@@ -4,7 +4,13 @@ import { createRotationTransition } from './watch-rotation.ts'
 import { createStreamStats } from './watch-stats.ts'
 import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type Signal } from './wire.ts'
 
-const token = location.hash.slice(1)
+declare global {
+  interface Window {
+    tabletLinkReceiver?: { rememberComputer(id: string, name: string, token: string): void }
+  }
+}
+
+const [, token, reconnect] = /^#([A-Za-z0-9_-]{32})(\.reconnect)?$/.exec(location.hash) ?? []
 const button = document.querySelector<HTMLButtonElement>('#connect')!
 const full = document.querySelector<HTMLButtonElement>('#fullscreen')!
 const fit = document.querySelector<HTMLButtonElement>('#fit')!
@@ -34,8 +40,8 @@ let followOrientation = false
 function reportOrientation() {
   if (!followOrientation || !channel || !activePeer) return
   const direction = portraitViewport.matches ? 'portrait' : 'landscape'
-  transmit(channel, { type: 'orientation', id: activePeer.id, direction })
   rotation.start(direction)
+  transmit(channel, { type: 'orientation', id: activePeer.id, direction })
 }
 
 portraitViewport.addEventListener('change', reportOrientation)
@@ -200,10 +206,12 @@ function connect(resuming = false) {
   socket.addEventListener('close', ({ code }) => {
     if (channel !== socket) return
     if (code === SHARE_ENDED) {
-      end('电脑已停止共享。请用电脑上的新二维码重新配对。')
+      end(reconnect ? '电脑已停止共享。请返回应用并重新选择电脑。' : '电脑已停止共享。请用电脑上的新二维码重新配对。')
       button.hidden = true
     } else if (code === VIEWER_REPLACED) end('共享已在另一连接中恢复。')
-    else connectionLost(opened ? '共享已断开。' : '无法连接。请确认两台设备在同一网络。电脑重新开始共享后，请扫新二维码。')
+    else connectionLost(opened ? '共享已断开。' : reconnect
+      ? '无法连接。请确认两台设备在同一网络，然后返回应用并重新选择电脑。'
+      : '无法连接。请确认两台设备在同一网络。电脑重新开始共享后，请扫新二维码。')
   })
 
   let queue = Promise.resolve()
@@ -216,6 +224,14 @@ function connect(resuming = false) {
       } else if (message.type === 'approved') {
         window.clearTimeout(timer)
         resumeToken = message.resumeToken
+        if (message.rememberedComputer) {
+          const { id, name, token } = message.rememberedComputer
+          try {
+            window.tabletLinkReceiver?.rememberComputer(id, name, token)
+          } catch {
+            // Bridge availability does not affect an approved stream.
+          }
+        }
         status.textContent = '正在等候第一帧画面…'
         const firstFrameTimeout = resuming ? Math.min(10000, Math.max(0, retryDeadline - Date.now())) : 20000
         timer = window.setTimeout(() => connectionLost('已连接电脑，但未收到画面。请重试。'), firstFrameTimeout)
@@ -282,6 +298,7 @@ video.addEventListener('playing', () => {
   retryDeadline = 0
   retryCount = 0
   const firstPlayback = !prompt.hidden
+  if (firstPlayback && followOrientation) rotation.start(portraitViewport.matches ? 'portrait' : 'landscape')
   prompt.hidden = true
   streamStats.show()
   fit.hidden = false
@@ -315,7 +332,16 @@ window.addEventListener('pagehide', () => {
   if (channel) end('已断开连接。')
 })
 
-if (!/^[\w-]{32}$/.test(token) || typeof RTCPeerConnection !== 'function') {
+if (!token || typeof RTCPeerConnection !== 'function') {
   button.hidden = true
-  status.textContent = token ? '浏览器不支持该连接，或链接已失效。' : '请用电脑端生成的二维码或完整链接打开。'
-} else button.addEventListener('click', () => void requestConnection())
+  status.textContent = location.hash ? '浏览器不支持该连接，或链接已失效。' : '请用电脑端生成的二维码或完整链接打开。'
+} else {
+  button.addEventListener('click', () => {
+    // Browsers require the gesture that opened the connection to request fullscreen.
+    if (!document.fullscreenElement && document.fullscreenEnabled) {
+      void stage.requestFullscreen({ navigationUI: 'hide' }).catch(() => {})
+    }
+    void requestConnection()
+  })
+  if (reconnect) void requestConnection()
+}

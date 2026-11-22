@@ -4,14 +4,14 @@ export function transmit(socket: WebSocket, message: Signal) {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message))
 }
 
-export function preferScreenH264(pc: RTCPeerConnection, sender: RTCRtpSender) {
+export function preferScreenCodec(pc: RTCPeerConnection, sender: RTCRtpSender, mimeType: 'video/VP8' | 'video/H264') {
   const transceiver = pc.getTransceivers().find((candidate) => candidate.sender === sender)
   const codecs = RTCRtpSender.getCapabilities('video')?.codecs
   if (!transceiver || !codecs) return
-  const h264 = codecs.filter((codec) => codec.mimeType === 'video/H264')
-  if (!h264.length) return
+  const preferred = codecs.filter((codec) => codec.mimeType === mimeType)
+  if (!preferred.length) return
   try {
-    transceiver.setCodecPreferences([...h264, ...codecs.filter((codec) => codec.mimeType !== 'video/H264')])
+    transceiver.setCodecPreferences([...preferred, ...codecs.filter((codec) => codec.mimeType !== mimeType)])
   } catch {
     // Keep the default negotiation when the platform cannot reorder codecs.
   }

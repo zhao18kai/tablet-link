@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { getDisplayRole, getDisplayPlacement, selectCaptureSource } from '../src/displays.ts'
+import { getDisplayRole, getDisplayPlacement, matchesPhysicalBounds, selectCaptureSource } from '../src/displays.ts'
+
+test('physical display matching allows DPI rounding at both edges', () => {
+  const native = { x: 1920, y: -40, width: 2560, height: 1440 }
+  assert.equal(matchesPhysicalBounds(native, { x: 1919, y: -41, width: 2562, height: 1442 }, 1.5), true)
+  assert.equal(matchesPhysicalBounds(native, { x: 1919, y: -41, width: 2550, height: 1442 }, 1.5), false)
+})
 
 test('only displays with a separate desktop origin qualify as extended screens', () => {
   const displays = [

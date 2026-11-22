@@ -18,12 +18,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 h1, h2, p, figure { margin: 0; }
 
 .desktop { display: grid; grid-template-columns: 168px minmax(0, 1fr); min-height: 100vh; }
-.sidebar { position: sticky; top: 0; height: 100vh; padding: 29px 13px; background: #f8fbf8; border-right: 1px solid var(--line); }
+.sidebar { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; padding: 29px 13px; background: #f8fbf8; border-right: 1px solid var(--line); }
 .app-name { padding-inline: 11px; color: #1b3931; font-size: 21px; font-weight: 740; }
 .sidebar-nav { display: grid; gap: 5px; margin-top: 28px; }
 .sidebar-nav button { width: 100%; padding: 10px 11px; text-align: left; background: transparent; color: #435850; }
 .sidebar-nav button:hover { background: #edf4ee; }
 .sidebar-nav button[aria-current='page'] { background: #dfede4; color: #135944; box-shadow: inset 3px 0 var(--accent); }
+.startup-option { margin-top: auto; padding-inline: 11px; }
+.startup-option label { margin: 0; }
+.startup-option label + label { margin-top: 9px; }
 .shell { width: 100%; max-width: 1050px; margin: 0 auto; padding: 25px 28px 32px; }
 .page-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; min-height: 43px; margin-bottom: 18px; }
 .page-header h1 { font-size: 28px; font-weight: 730; }
@@ -127,12 +130,12 @@ button { padding: 9px 13px; border: 1px solid transparent; border-radius: 8px; f
   color: #b5c7c9;
   font-size: 10px;
 }
-#stream-history { width: 100%; height: 19px; display: block; }
+#stream-history { width: 100%; height: 32px; display: block; }
 .screen { position: relative; flex: 1; min-height: 0; background: #080d0b; }
 .screen.touch-enabled { touch-action: none; user-select: none; }
 .screen video { width: 100%; height: 100%; object-fit: contain; display: block; }
 .screen video.video-cover { object-fit: cover; }
-#rotation-frame { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #080d0b; pointer-events: none; }
+#rotation-frame { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background-color: #40534b; pointer-events: none; }
 #viewer-surface { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; padding: 0; border-radius: 0; background: transparent; touch-action: manipulation; }
 #touch-hint { color: #bed0c6; font-size: 13px; }
 .viewer-prompt { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(380px, calc(100% - 44px)); text-align: center; padding: 22px; border-radius: 14px; background: #15251f; }

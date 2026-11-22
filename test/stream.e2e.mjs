@@ -1,29 +1,366 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { networkInterfaces } from 'node:os'
-import { join } from 'node:path'
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { networkInterfaces, tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { _electron, chromium } from 'playwright-core'
+import { build } from 'esbuild'
 
 test('Windows screen reaches a separate Chromium browser over a LAN address', { timeout: 60000 }, (t) => streamScreen(t))
 test('an extended Windows display sends its own desktop to the receiver', { timeout: 60000 }, (t) => streamScreen(t, true))
 
-async function streamScreen(t, extension = false) {
+test('the startup checkbox updates the Windows login entry', { timeout: 30000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'Tablet Link startup test '))
+  const name = basename(directory)
+  let app
+  t.after(async () => {
+    try {
+      await app?.evaluate(({ app }, name) => app.setLoginItemSettings({ name, openAtLogin: false }), name)
+    } finally {
+      await app?.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+  const dist = process.env.TABLET_LINK_EXE
+    ? join(dirname(process.env.TABLET_LINK_EXE), 'resources', 'app', 'dist')
+    : fileURLToPath(new URL('../dist', import.meta.url))
+  await cp(dist, join(directory, 'dist'), { recursive: true })
+  await writeFile(join(directory, 'package.json'), JSON.stringify({ name, main: 'dist/main.cjs' }))
+  const launch = (...flags) => _electron.launch({ args: [directory, `--user-data-dir=${join(directory, 'profile')}`, ...flags] })
+  app = await launch()
+  let host = await app.firstWindow()
+  const startup = () => host.getByRole('checkbox', { name: '开机自启' })
+  await startup().waitFor({ timeout: 4000 })
+  const entry = () => app.evaluate(({ app }, name) => app.getLoginItemSettings().launchItems.find((item) => item.name === name), name)
+  assert.equal(await startup().isChecked(), false)
+  assert.equal(await entry(), undefined)
+
+  await startup().check()
+  await host.locator('#launch-at-login:enabled').waitFor()
+  const installed = await entry()
+  assert.ok(installed?.enabled)
+  assert.equal(installed.scope, 'user')
+  assert.deepEqual(installed.args, [directory, 'tablet-link-login'], 'Windows launches this app even with spaces in its path')
+
+  await app.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0].reload() })
+  await host.locator('#launch-at-login:enabled').waitFor()
+  assert.equal(await startup().isChecked(), true)
+  await host.getByRole('checkbox', { name: '开机后自动共享' }).check()
+  await host.getByRole('button', { name: '开始共享' }).click()
+  await host.locator('#share-details').waitFor({ timeout: 8000 })
+  const address = await host.locator('#network').inputValue()
+  await app.close()
+  app = await launch()
+  host = await app.firstWindow()
+  await host.locator('#start:enabled').waitFor()
+  assert.equal(await host.locator('#share-details').isVisible(), false)
+  await app.close()
+  app = await launch('tablet-link-login')
+  host = await app.firstWindow()
+  await host.locator('#share-details').waitFor({ timeout: 12000 })
+  assert.equal(await host.locator('#network').inputValue(), address)
+  await startup().uncheck()
+  await host.locator('#launch-at-login:enabled').waitFor()
+  assert.equal(await entry(), undefined)
+})
+
+test('automatic extension waits for approval and releases its session when the viewer leaves', { timeout: 45000 }, async (t) => {
+  const executable = process.env.TABLET_LINK_EXE
+  const helper = executable
+    ? join(dirname(executable), 'resources', 'app', 'dist', 'tablet-pointer.exe')
+    : fileURLToPath(new URL('../dist/tablet-pointer.exe', import.meta.url))
+  const probe = spawnSync(helper, ['--probe-display'], { windowsHide: true })
+  assert.ok(probe.status === 0 || probe.status === 10, 'Windows must report whether it has a standby VDD output')
+  const app = await launchHost(t)
+  const browser = await chromium.launch({ executablePath: edgeExecutable() })
+  t.after(() => browser.close())
+  const host = await app.firstWindow()
+  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 } })
+  const displayIds = () => app.evaluate(({ screen }) =>
+    (globalThis.realDisplays?.() ?? screen.getAllDisplays()).map(({ id }) => id).sort())
+  const original = await displayIds()
+
+  await host.getByRole('radio', { name: '扩展副屏' }).check()
+  assert.equal(await host.locator('#source').inputValue(), 'automatic-display')
+  await host.getByRole('button', { name: '开始共享' }).click()
+  await host.locator('#share-details').waitFor({ state: 'visible' })
+  const approve = host.getByRole('button', { name: '允许连接' })
+  const status = (text) => host.waitForFunction((expected) => document.querySelector('#status').textContent.includes(expected), text)
+  await viewer.goto(await host.locator('#share-url').inputValue())
+  await viewer.getByRole('button', { name: '请求观看' }).click()
+  await approve.waitFor({ state: 'visible' })
+  assert.deepEqual(await displayIds(), original)
+  assert.equal(await viewer.locator('video').evaluate((video) => video.srcObject), null)
+
+  if (probe.status === 10) {
+    await approve.click()
+    await status('没有可用的备用虚拟屏')
+    assert.deepEqual(await displayIds(), original)
+    t.diagnostic('No physical standby output. The retry exercises real Electron capture with a simulated driver session.')
+    await app.evaluate(({ screen }) => {
+      const target = screen.getAllDisplays().find((display) => display.label === 'VDD by MTT' && display.id !== screen.getPrimaryDisplay().id)
+      if (!target) return
+      const { x, y, width, height } = screen.dipToScreenRect(null, target.bounds)
+      const children = process.getBuiltinModule('node:child_process')
+      const spawn = children.spawn
+      const realDisplays = screen.getAllDisplays.bind(screen)
+      globalThis.realDisplays = realDisplays
+      globalThis.testLease = { opened: 0, closed: 0 }
+      screen.getAllDisplays = () => globalThis.testLease.opened > globalThis.testLease.closed
+        ? realDisplays() : realDisplays().filter(({ id }) => id !== target.id)
+      children.spawn = function (file, args, options) {
+        if (args?.[0] !== '--lease-display') return spawn(file, args, options)
+        globalThis.testLease.opened++
+        const child = spawn(process.execPath, ['-e', `console.log('READY ${x} ${y} ${width - 1} ${height}'); process.stdin.resume()`],
+          { ...options, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
+        child.on('close', () => { globalThis.testLease.closed++ })
+        return child
+      }
+    })
+    if (!await app.evaluate(() => !!globalThis.testLease)) {
+      t.diagnostic('No active MTT VDD output for the simulated driver session.')
+      return
+    }
+    await viewer.getByRole('button', { name: '重新连接' }).click()
+    await approve.waitFor({ state: 'visible' })
+    assert.deepEqual(await app.evaluate(() => globalThis.testLease), { opened: 0, closed: 0 })
+  }
+
+  await approve.click()
+  await viewer.waitForFunction(() => document.querySelector('video').videoWidth > 0, undefined, { timeout: 18000 })
+  if (probe.status === 0) {
+    const active = await displayIds()
+    assert.equal(active.length, original.length + 1)
+    assert.ok(original.every((id) => active.includes(id)))
+  } else {
+    assert.deepEqual(await app.evaluate(() => globalThis.testLease), { opened: 1, closed: 0 })
+  }
+  await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
+  await viewer.getByRole('button', { name: '显示全屏控件' }).click()
+  await viewer.locator('#leave').click()
+  await status('等待平板连接')
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const restored = probe.status === 0 ? (await displayIds()).length === original.length
+      : (await app.evaluate(() => globalThis.testLease)).closed === 1
+    if (restored) break
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  assert.deepEqual(await displayIds(), original)
+  if (probe.status === 10) assert.deepEqual(await app.evaluate(() => globalThis.testLease), { opened: 1, closed: 1 })
+})
+
+function edgeExecutable() {
   const edge = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles]
     .filter(Boolean)
     .map((directory) => join(directory, 'Microsoft', 'Edge', 'Application', 'msedge.exe'))
     .find(existsSync)
   assert.ok(edge, 'The Windows end-to-end test needs Microsoft Edge')
+  return edge
+}
+
+async function launchHost(t) {
+  const executablePath = process.env.TABLET_LINK_EXE
+  const profile = await mkdtemp(join(tmpdir(), 'tablet-link-e2e-'))
+  let app
+  t.after(async () => {
+    try { await app?.close() }
+    finally { await rm(profile, { recursive: true, force: true, maxRetries: 4 }) }
+  })
+  app = await _electron.launch({
+    args: [...(executablePath ? [] : ['.']), `--user-data-dir=${profile}`],
+    executablePath,
+    timeout: 20000,
+  })
+  return app
+}
+
+test('fullscreen rotation keeps playing while waiting for the first new video frame', { timeout: 30000 }, async (t) => {
+  const browser = await chromium.launch({ executablePath: edgeExecutable() })
+  t.after(() => browser.close())
+  await t.test('holds one uncropped image and switches without blending', (t) => verifyRotation(t, browser, false))
+  await t.test('keeps the same single-image behavior with the frame callback fallback', (t) => verifyRotation(t, browser, true))
+})
+
+async function verifyRotation(t, browser, useFallback) {
+  const landscape = { width: 1200, height: 800 }
+  const portrait = { width: 800, height: 1160 }
+  const viewer = await browser.newPage({ viewport: landscape, reducedMotion: useFallback ? 'reduce' : 'no-preference' })
+  t.after(() => viewer.close())
+  const viewerFile = (name) => new URL(`../src/ui/${name}`, import.meta.url)
+  const [html, css, script] = await Promise.all([
+    readFile(viewerFile('watch.html'), 'utf8'),
+    readFile(viewerFile('app.css'), 'utf8'),
+    build({
+      stdin: {
+        contents: `import { createRotationTransition } from './src/watch-rotation.ts';
+          window.createRotationTransition = createRotationTransition`,
+        resolveDir: fileURLToPath(new URL('..', import.meta.url)),
+      },
+      bundle: true, write: false, format: 'iife',
+    }),
+  ])
+  await viewer.setContent(html)
+  await viewer.addStyleTag({ content: css })
+  await viewer.addScriptTag({ content: script.outputFiles[0].text })
+  await viewer.evaluate((useFallback) => {
+    const video = document.querySelector('video')
+    if (useFallback) Object.defineProperty(video, 'requestVideoFrameCallback', { value: undefined })
+    const snapshot = document.querySelector('#rotation-frame')
+    const source = document.createElement('canvas')
+    const context = source.getContext('2d')
+    const transition = window.createRotationTransition(video, snapshot, () => {})
+    const orientation = matchMedia('(orientation: portrait)')
+    orientation.addEventListener('change', () => transition.start(orientation.matches ? 'portrait' : 'landscape'))
+    const full = document.querySelector('#fullscreen')
+    full.disabled = false
+    full.addEventListener('click', () => document.querySelector('#stage').requestFullscreen())
+    document.querySelector('#viewer-prompt').hidden = true
+    function draw(width, height, color, blackEdge = false, markBottom = false) {
+      source.width = width
+      source.height = height
+      context.fillStyle = color
+      context.fillRect(0, 0, width, height)
+      if (markBottom) {
+        context.fillStyle = '#f3bf40'
+        context.fillRect(0, height * 0.55, width, height * 0.45)
+      }
+      if (blackEdge) {
+        context.fillStyle = '#000000'
+        if (height > width) context.fillRect(0, height * 0.65, width, height * 0.35)
+        else context.fillRect(width * 0.65, 0, width * 0.35, height)
+      }
+    }
+    draw(300, 200, '#208060', false, true)
+    const stream = source.captureStream(0)
+    video.srcObject = stream
+    const [track] = stream.getVideoTracks()
+    window.showFrame = (width, height, color, blackEdge, markBottom) => {
+      draw(width, height, color, blackEdge, markBottom)
+      track.requestFrame()
+    }
+  }, useFallback)
+  await viewer.waitForFunction(() => document.querySelector('video').readyState >= HTMLMediaElement.HAVE_CURRENT_DATA)
+  await viewer.locator('#fullscreen').click()
+  await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
+  const snapshot = viewer.locator('#rotation-frame')
+
+  for (const [size, previousColor, width, height, color, lateColor, lateRGB] of [
+    [portrait, [32, 128, 96], 200, 300, '#a04830', '#486ac2', [72, 106, 194]],
+    [landscape, [160, 72, 48], 300, 200, '#208060', '#9858b0', [152, 88, 176]],
+  ]) {
+    await viewer.setViewportSize(size)
+    await snapshot.waitFor({ state: 'visible' })
+    assert.deepEqual(await snapshot.evaluate((canvas) => [canvas.width, canvas.height, getComputedStyle(canvas).objectFit]),
+      [height, width, 'contain'], 'the outgoing image must stay at its original aspect ratio and fit without cropping')
+    const rows = await snapshot.evaluate((canvas) => {
+      const context = canvas.getContext('2d')
+      return [0.2, 0.8].map((y) => Array.from(context.getImageData(canvas.width * 0.45, canvas.height * y, 1, 1).data).slice(0, 3))
+    })
+    assert.ok(rows[0].every((value, i) => Math.abs(value - previousColor[i]) <= 3) &&
+      rows[1].every((value, i) => Math.abs(value - [243, 191, 64][i]) <= 3),
+    `the outgoing image should keep its top and bottom until the desktop switches, got ${JSON.stringify(rows)}`)
+    const screenshot = await viewer.screenshot()
+    const corner = await viewer.evaluate(async (png) => {
+      const img = new Image()
+      img.src = `data:image/png;base64,${png}`
+      await img.decode()
+      const pixel = document.createElement('canvas').getContext('2d')
+      pixel.drawImage(img, 8, 12, 1, 1, 0, 0, 1, 1)
+      return Array.from(pixel.getImageData(0, 0, 1, 1).data).slice(0, 3)
+    }, screenshot.toString('base64'))
+    assert.ok(corner.every((value, i) => Math.abs(value - [64, 83, 75][i]) <= 3),
+      `the space around the fitted frame should have an opaque backdrop, got ${corner}`)
+    await viewer.evaluate(({ width, height }) => window.showFrame(height, width, '#000000'), { width, height })
+    await viewer.waitForTimeout(160)
+    const retained = await snapshot.evaluate((canvas) => Array.from(canvas.getContext('2d').getImageData(8, 12, 1, 1).data).slice(0, 3))
+    assert.ok(retained.every((value, i) => Math.abs(value - previousColor[i]) <= 3),
+      'an incomplete frame at the outgoing dimensions must leave the last good frame intact')
+    await viewer.evaluate(({ width, height, lateColor }) => window.showFrame(height, width, lateColor), { width, height, lateColor })
+    await viewer.waitForFunction((expected) => {
+      const canvas = document.querySelector('#rotation-frame')
+      if (canvas.hidden) return false
+      const pixel = canvas.getContext('2d').getImageData(8, 12, 1, 1).data
+      return expected.every((value, i) => Math.abs(pixel[i] - value) <= 3)
+    }, lateRGB, { timeout: 700 })
+    await viewer.evaluate(() => window.showFrame(250, 250, '#000000'))
+    await viewer.waitForFunction(() => document.querySelector('video').videoWidth === 250)
+    const transitionFrame = await snapshot.evaluate(async (canvas) => {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      if (canvas.hidden || canvas.getAnimations().length) return null
+      return Array.from(canvas.getContext('2d').getImageData(8, 12, 1, 1).data).slice(0, 3)
+    })
+    assert.ok(transitionFrame?.every((value, i) => Math.abs(value - lateRGB[i]) <= 3),
+      'a square frame must neither replace the transition image nor reveal the live video')
+    await viewer.evaluate(({ width, height }) => window.showFrame(width, height, '#000000'), { width, height })
+    await viewer.waitForFunction((width) => document.querySelector('video').videoWidth === width, width)
+    await viewer.waitForTimeout(170)
+    assert.ok(await snapshot.evaluate((canvas) => !canvas.hidden && canvas.getAnimations().length === 0),
+      'the first fully black frame at the new dimensions must stay covered')
+    await viewer.evaluate(({ width, height, color }) => window.showFrame(width, height, color, true), { width, height, color })
+    await viewer.waitForFunction((width) => document.querySelector('video').videoWidth === width, width)
+    const stillCovered = await snapshot.evaluate(async (canvas) => {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      return !canvas.hidden && canvas.getAnimations().length === 0
+    })
+    assert.ok(stillCovered, 'a matching frame with a black edge should stay covered')
+    const painted = await snapshot.evaluate((canvas) => {
+      const ctx = canvas.getContext('2d')
+      return [[12, 12], [canvas.width - 12, canvas.height - 12]].map(([x, y]) =>
+        Array.from(ctx.getImageData(x, y, 1, 1).data).slice(0, 3))
+    })
+    assert.ok(painted.every((pixel) => pixel.every((value, i) => Math.abs(value - lateRGB[i]) <= 3)),
+      'an incomplete new frame must never be painted over the previous image')
+    // Some Windows modes report the new dimensions well before the whole desktop is painted.
+    await viewer.waitForTimeout(400)
+    assert.ok(await snapshot.evaluate((canvas) => !canvas.hidden && canvas.getAnimations().length === 0),
+      'the first incomplete frame must stay covered beyond the short resize settling period')
+    await viewer.evaluate(async ({ width, height, color }) => {
+      window.showFrame(width, height, color)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      window.showFrame(width, height, color, true)
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    }, { width, height, color })
+    assert.ok(await snapshot.evaluate((canvas) => !canvas.hidden && canvas.getAnimations().length === 0),
+      'a clean frame followed by an incomplete frame should also stay covered')
+    const blended = await viewer.evaluate(({ width, height, color }) => new Promise((resolve) => {
+      const video = document.querySelector('video')
+      const snapshot = document.querySelector('#rotation-frame')
+      function observe() {
+        if (snapshot.hidden) return resolve(false)
+        const opacity = Number(getComputedStyle(snapshot).opacity)
+        if (video.videoWidth === width && video.videoHeight === height && opacity > 0 && opacity < 1) return resolve(true)
+        requestAnimationFrame(observe)
+      }
+      requestAnimationFrame(observe)
+      window.showFrame(width, height, color, false, true)
+    }), { width, height, color })
+    assert.equal(blended, false, 'two frames must never be visible during the switch')
+    await viewer.waitForFunction(({ width, height }) => {
+      const video = document.querySelector('video')
+      return video.videoWidth === width && video.videoHeight === height && document.querySelector('#rotation-frame').hidden
+    }, { width, height }, { timeout: 1200 })
+    assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
+  }
+
+  await viewer.setViewportSize(portrait)
+  await snapshot.waitFor({ state: 'visible' })
+  await viewer.evaluate(() => window.showFrame(200, 300, '#a04830', true))
+  await viewer.waitForTimeout(2000)
+  assert.ok(await snapshot.isVisible(), 'the old snapshot should cover a long run of incomplete new frames')
+  // Persistent dark content has a bounded fallback so the receiver cannot stay frozen.
+  await snapshot.waitFor({ state: 'hidden', timeout: 2300 })
+}
+
+async function streamScreen(t, extension = false) {
+  const edge = edgeExecutable()
   const address = Object.values(networkInterfaces()).flat().find((entry) => (
     entry?.family === 'IPv4' && /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(entry.address)
   ))?.address
   assert.ok(address, 'The test needs a private IPv4 address')
-  const app = await _electron.launch({
-    args: process.env.TABLET_LINK_EXE ? [] : ['.'],
-    executablePath: process.env.TABLET_LINK_EXE,
-    timeout: 20000,
-  })
-  t.after(() => app.close())
+  const app = await launchHost(t)
   const host = await app.firstWindow()
   await host.evaluate(() => {
     const Original = window.RTCPeerConnection
@@ -94,7 +431,7 @@ async function streamScreen(t, extension = false) {
     assert.ok(target, 'The requested extended display must be active and capturable')
     await host.getByRole('radio', { name: '扩展副屏' }).check()
     const listed = await host.locator('#source option').evaluateAll((options) => options.map(({ value }) => value))
-    assert.deepEqual(listed, extendedDisplays.map(({ id }) => id))
+    assert.deepEqual(listed, ['automatic-display', ...extendedDisplays.map(({ id }) => id)])
     await host.locator('#source').selectOption(target.id)
     await host.getByRole('checkbox', { name: '允许平板触控' }).check()
 
@@ -141,6 +478,7 @@ async function streamScreen(t, extension = false) {
     return video.videoWidth > 0 && video.currentTime > 0.25
   }, undefined, { timeout: 20000 })
   const dimensions = await viewer.locator('video').evaluate((video) => [video.videoWidth, video.videoHeight])
+  await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage', undefined, { timeout: 2500 })
   t.diagnostic(`Decoded ${dimensions.join(' × ')} video from Windows screen capture`)
   const streamHud = viewer.locator('#stream-hud')
   await streamHud.waitFor({ state: 'visible' })
@@ -226,8 +564,6 @@ async function streamScreen(t, extension = false) {
     await viewer.locator('.screen.touch-enabled').waitFor({ state: 'hidden', timeout: 2000 })
   }
 
-  await viewer.getByRole('button', { name: '全屏', exact: true }).click()
-  await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
   await viewer.locator('.viewer-bar').waitFor({ state: 'hidden', timeout: 3000 })
   assert.ok(await streamHud.isVisible())
   assert.equal(await streamHud.evaluate((node) => getComputedStyle(node).pointerEvents), 'none')

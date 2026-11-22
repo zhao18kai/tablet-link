@@ -7,14 +7,17 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import WebSocket from 'ws'
-import { startLanServer } from '../src/lan.ts'
+import { startLanServer, type RememberedComputer } from '../src/lan.ts'
 
-async function setup(t: test.TestContext, onOrientation?: (orientation: string) => void) {
+async function setup(
+  t: test.TestContext, onOrientation?: (orientation: string) => void, onViewerGone?: (id: string) => void,
+  rememberedComputer?: RememberedComputer,
+) {
   const dir = await mkdtemp(join(tmpdir(), 'tablet-link-test-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   await writeFile(join(dir, 'watch.html'), '<title>Receiver</title>')
   await writeFile(join(dir, 'private.txt'), 'not public')
-  const server = await startLanServer('127.0.0.1', dir, onOrientation)
+  const server = await startLanServer('127.0.0.1', dir, onOrientation, rememberedComputer && 'lan', onViewerGone, rememberedComputer)
   t.after(() => server.stop())
   const viewerUrl = new URL(server.viewerUrl)
   const viewerWs = new URL('/viewer', viewerUrl)
@@ -63,6 +66,7 @@ async function approveViewer(host: WebSocket, viewerWs: URL, origin: string) {
 test('the LAN server serves only viewer assets and shuts down', async (t) => {
   const { server, viewerUrl } = await setup(t)
   const response = await fetch(viewerUrl)
+  assert.equal(response.headers.get('cache-control'), 'no-store')
   assert.match(await response.text(), /Receiver/)
   assert.equal((await fetch(new URL('/private.txt', viewerUrl))).status, 404)
   await server.stop()
@@ -136,13 +140,45 @@ test('rejecting a viewer releases its slot for a fresh request', async (t) => {
   await connect(viewerWs, viewerUrl.origin).opened
 })
 
+test('automatic capture is authorized only for the current approved viewer and revoked on departure', async (t) => {
+  const gone: string[] = []
+  const { server, viewerUrl, viewerWs } = await setup(t, undefined, (id) => { gone.push(id) })
+  const host = connect(server.hostUrl, 'null')
+  await host.opened
+  const request = receive(host.socket)
+  const viewer = connect(viewerWs, viewerUrl.origin)
+  await viewer.opened
+  const { id } = await request
+  assert.equal(server.isViewerApproved(id), false)
+  const approval = receive(viewer.socket)
+  const hostApproval = receive(host.socket)
+  host.socket.send(JSON.stringify({ type: 'approve', id }))
+  const { resumeToken } = await approval
+  await hostApproval
+  assert.equal(server.isViewerApproved(id), true)
+  const departure = receive(host.socket)
+  viewer.socket.close()
+  assert.deepEqual(await departure, { type: 'viewer-left', id })
+  assert.deepEqual(gone, [id])
+  assert.equal(server.isViewerApproved(id), false)
+
+  const resumeUrl = new URL(viewerWs)
+  resumeUrl.searchParams.set('resume', resumeToken)
+  const resumed = connect(resumeUrl, viewerUrl.origin)
+  const resumedApproval = receive(resumed.socket)
+  await resumed.opened
+  const { id: resumedId } = await resumedApproval
+  assert.notEqual(resumedId, id)
+  assert.equal(server.isViewerApproved(resumedId), true)
+  await server.stop()
+  assert.equal(server.isViewerApproved(resumedId), false)
+  assert.deepEqual(gone, [id, resumedId])
+})
+
 test('rotation follows the most recent valid direction from an approved viewer', { timeout: 4000 }, async (t) => {
   const applied: string[] = []
-  let resolveRotation!: () => void
-  const rotated = new Promise<void>((resolve) => { resolveRotation = resolve })
   const { server, viewerUrl, viewerWs } = await setup(t, (orientation) => {
     applied.push(orientation)
-    resolveRotation()
   })
   const host = connect(server.hostUrl, 'null')
   await host.opened
@@ -151,6 +187,7 @@ test('rotation follows the most recent valid direction from an approved viewer',
   await viewer.opened
   const { id } = await request
   const orientation = (direction: string, session = id) => JSON.stringify({ type: 'orientation', id: session, direction })
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   viewer.socket.send(orientation('portrait'))
   const received = once(viewer.socket, 'pong')
   viewer.socket.ping()
@@ -158,7 +195,7 @@ test('rotation follows the most recent valid direction from an approved viewer',
   const approved = receive(viewer.socket)
   host.socket.send(JSON.stringify({ type: 'approve', id }))
   assert.equal((await approved).followOrientation, true)
-  await delay(200)
+  t.mock.timers.tick(100)
   assert.deepEqual(applied, [])
 
   viewer.socket.send(orientation('portrait'))
@@ -166,8 +203,14 @@ test('rotation follows the most recent valid direction from an approved viewer',
   viewer.socket.send(orientation('portrait', 'old-session'))
   viewer.socket.send(orientation('arbitrary-mode'))
   host.socket.send(orientation('portrait'))
-  await rotated
+  const directionsReceived = once(viewer.socket, 'pong')
+  viewer.socket.ping()
+  await directionsReceived
+  t.mock.timers.tick(39)
+  assert.deepEqual(applied, [])
+  t.mock.timers.tick(1)
   assert.deepEqual(applied, ['landscape'])
+  t.mock.timers.reset()
 })
 
 test('approval for a departed viewer cannot approve the next viewer', async (t) => {
@@ -266,6 +309,60 @@ test('the QR token alone still requires approval and a new approval revokes the 
   second.socket.terminate()
   await secondDeparture
   await assert.rejects(connect(first.resumeUrl, viewerUrl.origin).opened, /403/)
+})
+
+test('a remembered computer can be requested on a new share but only streams after fresh approval', { timeout: 5000 }, async (t) => {
+  const remembered = { id: 'a'.repeat(32), name: 'Windows PC', token: 'r'.repeat(32) }
+  const first = await setup(t, undefined, undefined, remembered)
+  const firstHost = connect(first.server.hostUrl, 'null')
+  await firstHost.opened
+  const firstRequest = receive(firstHost.socket)
+  const firstViewer = connect(first.viewerWs, first.viewerUrl.origin)
+  const firstApproval = receive(firstViewer.socket)
+  await firstViewer.opened
+  const { id: firstId } = await firstRequest
+  const firstHostApproval = receive(firstHost.socket)
+  firstHost.socket.send(JSON.stringify({ type: 'approve', id: firstId }))
+  const approved = await firstApproval
+  assert.equal(approved.type, 'approved')
+  assert.deepEqual(approved.rememberedComputer, remembered)
+  assert.deepEqual(await firstHostApproval, { type: 'approved', id: firstId })
+  await first.server.stop()
+
+  const second = await setup(t, undefined, undefined, remembered)
+  const secondHost = connect(second.server.hostUrl, 'null')
+  await secondHost.opened
+  const reconnectUrl = new URL(second.viewerWs)
+  reconnectUrl.searchParams.set('token', remembered.token)
+  await assert.rejects(connect(reconnectUrl, 'http://foreign.test').opened, /403/)
+  const earlierResume = new URL(reconnectUrl)
+  earlierResume.searchParams.set('resume', approved.resumeToken)
+  await assert.rejects(connect(earlierResume, second.viewerUrl.origin).opened, /403/)
+
+  const secondRequest = receive(secondHost.socket)
+  const secondViewer = connect(reconnectUrl, second.viewerUrl.origin)
+  await secondViewer.opened
+  const request = await secondRequest
+  const { id } = request
+  assert.deepEqual(request, { type: 'viewer-request', id })
+  assert.equal(second.server.isViewerApproved(id), false)
+  const secondApproval = receive(secondViewer.socket)
+  secondHost.socket.send(JSON.stringify({ type: 'offer', id, description: { type: 'offer', sdp: 'pending' } }))
+  secondHost.socket.send(JSON.stringify({ type: 'approve', id }))
+  const confirmation = await secondApproval
+  assert.equal(confirmation.type, 'approved')
+  assert.equal(second.server.isViewerApproved(id), true)
+  assert.deepEqual(confirmation.rememberedComputer, remembered)
+  assert.notEqual(confirmation.resumeToken, remembered.token)
+
+  const wrongCredential = new URL(second.viewerWs)
+  wrongCredential.searchParams.set('resume', confirmation.resumeToken)
+  await assert.rejects(connect(wrongCredential, second.viewerUrl.origin).opened, /403/)
+  reconnectUrl.searchParams.set('resume', confirmation.resumeToken)
+  const recovered = connect(reconnectUrl, second.viewerUrl.origin)
+  const recoveredApproval = receive(recovered.socket)
+  await recovered.opened
+  assert.equal((await recoveredApproval).resumeToken, confirmation.resumeToken)
 })
 
 test('a viewer cannot resume after explicitly leaving', { timeout: 5000 }, async (t) => {

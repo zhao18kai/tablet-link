@@ -16,6 +16,11 @@
       <button type="button" data-page="quality" aria-controls="quality">画质设置</button>
       <button type="button" data-page="about" aria-controls="about">关于</button>
     </nav>
+    <div class="startup-option" id="startup-option" hidden>
+      <label class="touch-option"><input type="checkbox" id="launch-at-login" disabled>开机自启</label>
+      <label class="touch-option"><input type="checkbox" id="share-at-login" disabled>开机后自动共享</label>
+      <p class="field-note" id="startup-status" role="status"></p>
+    </div>
   </aside>
   <main class="shell">
     <header class="page-header">
@@ -35,7 +40,7 @@
           <label><input type="radio" name="mode" id="mode-extension" value="extension">扩展副屏</label>
         </fieldset>
         <div id="display-hint" class="display-hint" hidden>
-          <p>选择 Windows 已启用的扩展屏。使用虚拟屏时，请先安装并启用虚拟显示驱动。</p>
+          <p>自动副屏需要一块未接入桌面的 VDD by MTT 虚拟屏。也可选择已启用的扩展屏。</p>
           <button class="quiet" id="display-settings" type="button">打开 Windows 显示设置</button>
         </div>
         <label for="source">共享屏幕</label>

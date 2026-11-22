@@ -9,7 +9,8 @@ await Promise.all([
   process.platform === 'win32' && promisify(execFile)(
     join(process.env.SystemRoot, 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe'),
     ['/nologo', '/target:exe', '/optimize+', `/out:${resolve('dist', 'tablet-pointer.exe')}`,
-      resolve('src', 'windows', 'TabletPointer.cs'), resolve('src', 'windows', 'VirtualDisplay.cs')],
+      resolve('src', 'windows', 'TabletPointer.cs'), resolve('src', 'windows', 'VirtualDisplay.cs'),
+      resolve('src', 'windows', 'DisplayLease.cs')],
     { windowsHide: true },
   ),
   build({

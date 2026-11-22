@@ -3,6 +3,8 @@ import type { DisplayRole, DisplaySide } from './displays.ts'
 export const SHARE_ENDED = 4000
 export const VIEWER_LEAVING = 4001
 export const VIEWER_REPLACED = 4002
+export const AUTOMATIC_DISPLAY = 'automatic-display'
+export const AUTOMATIC_CAPTURE_EVENT = 'tablet-link-automatic-capture'
 
 export type MediaSignal =
   | { type: 'offer' | 'answer'; description: RTCSessionDescriptionInit }
@@ -10,11 +12,12 @@ export type MediaSignal =
 
 export type DisplayOrientation = 'landscape' | 'portrait'
 export type ConnectionMode = 'lan' | 'usb'
+export type RememberedComputer = { id: string; name: string; token: string }
 
 export type Signal = (
   | MediaSignal
   | { type: 'viewer-request'; resumed?: boolean }
-  | { type: 'approved'; resumeToken?: string; followOrientation?: true; connectionMode?: ConnectionMode }
+  | { type: 'approved'; resumeToken?: string; followOrientation?: true; connectionMode?: ConnectionMode; rememberedComputer?: RememberedComputer }
   | { type: 'orientation'; direction: DisplayOrientation }
   | { type: 'viewer-left' | 'approve' | 'reject' | 'rejected' }
 ) & { id: string }
@@ -46,14 +49,19 @@ export interface TabletLink {
   sources(): Promise<CaptureSource[]>
   networks(): Promise<NetworkAddress[]>
   selectSource(id: string, displayId: string, mode: CaptureMode): Promise<void>
-  start(address: string, allowTouch: boolean, followOrientation: boolean, mode: ConnectionMode): Promise<ShareInfo>
+  start(address: string, allowTouch: boolean, followOrientation: boolean, mode: ConnectionMode, automatic?: boolean): Promise<ShareInfo>
+  captureAutomaticDisplay(viewer: string): Promise<void>
   stop(): Promise<void>
   remotePointer(command: string): void
   copy(text: string): Promise<void>
   openDisplaySettings(): Promise<void>
   placeDisplay(displayId: string, referenceId: string, side: DisplaySide): Promise<void>
   getVersion(): Promise<string>
+  launchAtLogin(enabled?: boolean): Promise<boolean | null>
+  startedAtLogin(): Promise<boolean>
+  startLoginShare(): Promise<void>
   openProject(): Promise<void>
   onDisplaysChanged(callback: () => void): void
   onCaptureLost(callback: () => void): void
+  onDisplayCleanupFailed(callback: () => void): void
 }

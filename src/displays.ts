@@ -10,6 +10,16 @@ interface DisplayRect extends DisplayPosition {
   bounds: DisplayPosition['bounds'] & { width: number; height: number }
 }
 
+export function matchesPhysicalBounds(
+  native: DisplayRect['bounds'], electron: DisplayRect['bounds'], scaleFactor: number,
+) {
+  // Both DPI conversions enclose their input rectangles, so either edge can move by a few pixels.
+  const tolerance = Math.ceil(scaleFactor) + 1
+  return Math.abs(native.x - electron.x) <= tolerance && Math.abs(native.y - electron.y) <= tolerance &&
+    Math.abs(native.x + native.width - electron.x - electron.width) <= tolerance &&
+    Math.abs(native.y + native.height - electron.y - electron.height) <= tolerance
+}
+
 export function getDisplayPlacement(
   displays: readonly DisplayRect[], target: DisplayRect, reference: DisplayRect, side: DisplaySide,
 ) {

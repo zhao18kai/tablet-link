@@ -1,87 +1,139 @@
 import type { DisplayOrientation } from './wire.ts'
 
-const maxHoldMs = 1800
-const fadeMs = 90
+const maxHoldMs = 3500
+const completeFrameSettleMs = 100
+const sampleSize = 24
+const edges = ['left', 'right', 'top', 'bottom'] as const
 
 function matchesOrientation(width: number, height: number, direction: DisplayOrientation) {
-  return width > 0 && height > 0 && (height > width) === (direction === 'portrait')
+  return width > 0 && height > 0 && (direction === 'portrait' ? height > width : width > height)
+}
+
+function hasBlackEdge(video: HTMLVideoElement, sample: CanvasRenderingContext2D | null) {
+  if (!sample) return false
+  let pixels: Uint8ClampedArray
+  try {
+    sample.drawImage(video, 0, 0, sampleSize, sampleSize)
+    pixels = sample.getImageData(0, 0, sampleSize, sampleSize).data
+  } catch {
+    return false
+  }
+  const black = (x: number, y: number) => {
+    const index = (y * sampleSize + x) * 4
+    return Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) <= 22
+  }
+  return edges.some((edge) => {
+    const near = edge === 'left' || edge === 'top' ? 1 : sampleSize - 2
+    const vertical = edge === 'left' || edge === 'right'
+    let count = 0
+    for (let i = 3; i < sampleSize - 3; i++) count += Number(vertical ? black(near, i) : black(i, near))
+    return count >= sampleSize - 7
+  })
 }
 
 export function createRotationTransition(video: HTMLVideoElement, overlay: HTMLCanvasElement, onWaitingChange: (waiting: boolean) => void) {
-  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)')
+  const hasVideoFrameCallback = typeof video.requestVideoFrameCallback === 'function'
+  const probe = document.createElement('canvas')
+  probe.width = probe.height = sampleSize
+  const sample = probe.getContext('2d', { willReadFrequently: true })
   let direction: DisplayOrientation | undefined
   let timeout: number | undefined
+  let completeFrameTimeout: number | undefined
   let videoCallback: number | undefined
   let paintCallback: number | undefined
-  let fade: Animation | undefined
+
+  function stopWatchingFrames() {
+    window.clearTimeout(completeFrameTimeout)
+    if (videoCallback !== undefined) video.cancelVideoFrameCallback?.(videoCallback)
+    if (paintCallback !== undefined) window.cancelAnimationFrame(paintCallback)
+    videoCallback = paintCallback = completeFrameTimeout = undefined
+  }
 
   function clear() {
     if (!direction) return
     direction = undefined
     window.clearTimeout(timeout)
-    if (videoCallback !== undefined) video.cancelVideoFrameCallback?.(videoCallback)
-    if (paintCallback !== undefined) window.cancelAnimationFrame(paintCallback)
-    videoCallback = paintCallback = undefined
+    stopWatchingFrames()
     overlay.hidden = true
     overlay.width = overlay.height = 0
-    const previousFade = fade
-    fade = undefined
-    previousFade?.cancel()
     onWaitingChange(false)
   }
 
-  function reveal() {
-    if (reducedMotion.matches || typeof overlay.animate !== 'function') {
-      clear()
-      return
-    }
-    const animation = overlay.animate([{ opacity: 1 }, { opacity: 0 }], { duration: fadeMs, fill: 'forwards' })
-    fade = animation
-    const finished = () => { if (fade === animation) clear() }
-    void animation.finished.then(finished, finished)
-  }
-
-  function waitForPresentation() {
-    if (!direction || fade || videoCallback !== undefined || paintCallback !== undefined ||
-        !matchesOrientation(video.videoWidth, video.videoHeight, direction)) return
-    if (typeof video.requestVideoFrameCallback === 'function') {
+  function watchFrame(onFrame: (width: number, height: number) => void) {
+    if (hasVideoFrameCallback) {
       videoCallback = video.requestVideoFrameCallback((_, frame) => {
         videoCallback = undefined
-        if (direction && matchesOrientation(frame.width, frame.height, direction)) reveal()
-        else waitForPresentation()
+        onFrame(frame.width, frame.height)
       })
     } else {
       paintCallback = window.requestAnimationFrame(() => {
         paintCallback = undefined
-        if (direction && matchesOrientation(video.videoWidth, video.videoHeight, direction)) reveal()
+        onFrame(video.videoWidth, video.videoHeight)
       })
     }
   }
-
-  video.addEventListener('resize', waitForPresentation)
 
   return {
     get waiting() { return direction !== undefined },
     start(next: DisplayOrientation) {
       if (direction === next) return
-      clear()
+      const wasWaiting = direction !== undefined
       const { videoWidth, videoHeight } = video
-      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !videoWidth || !videoHeight ||
-          matchesOrientation(videoWidth, videoHeight, next)) return
+      const previous = next === 'portrait' ? 'landscape' : 'portrait'
       const context = overlay.getContext('2d')
       if (!context) return
-      overlay.width = videoWidth
-      overlay.height = videoHeight
-      try {
-        context.drawImage(video, 0, 0)
-      } catch {
-        overlay.width = overlay.height = 0
-        return
+
+      const drawOutgoingFrame = () => {
+        try {
+          context.drawImage(video, 0, 0)
+          return true
+        } catch {
+          return false
+        }
       }
+      if (wasWaiting) {
+        window.clearTimeout(timeout)
+        stopWatchingFrames()
+      } else {
+        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+            !matchesOrientation(videoWidth, videoHeight, previous)) return
+        // Keep the complete frame at its natural size and let CSS fit it into the viewport.
+        overlay.width = videoWidth
+        overlay.height = videoHeight
+        if (!drawOutgoingFrame()) {
+          overlay.width = overlay.height = 0
+          return
+        }
+      }
+
+      let lastVideoTime = video.currentTime
+
+      function updateFrame(width: number, height: number) {
+        if (direction !== next) return
+        const targetFrame = matchesOrientation(width, height, next) && matchesOrientation(video.videoWidth, video.videoHeight, next)
+        if (targetFrame && !hasBlackEdge(video, sample)) {
+          completeFrameTimeout ??= window.setTimeout(() => {
+            completeFrameTimeout = undefined
+            if (direction === next && matchesOrientation(video.videoWidth, video.videoHeight, next) && !hasBlackEdge(video, sample)) clear()
+          }, completeFrameSettleMs)
+        } else {
+          window.clearTimeout(completeFrameTimeout)
+          completeFrameTimeout = undefined
+          if ((hasVideoFrameCallback || video.currentTime !== lastVideoTime) &&
+              width === overlay.width && height === overlay.height && width === video.videoWidth && height === video.videoHeight &&
+              matchesOrientation(width, height, previous) && !hasBlackEdge(video, sample)) {
+            drawOutgoingFrame()
+            lastVideoTime = video.currentTime
+          }
+        }
+        if (direction === next) watchFrame(updateFrame)
+      }
+
       direction = next
       overlay.hidden = false
       timeout = window.setTimeout(clear, maxHoldMs)
-      onWaitingChange(true)
+      watchFrame(updateFrame)
+      if (!wasWaiting) onWaitingChange(true)
     },
     clear,
   }

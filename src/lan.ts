@@ -5,14 +5,18 @@ import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
-import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type ConnectionMode, type DisplayOrientation, type Signal } from './wire.ts'
+import { advertiseShare } from './lan-discovery.ts'
+import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type ConnectionMode, type DisplayOrientation, type RememberedComputer, type Signal } from './wire.ts'
+
+export type { RememberedComputer } from './wire.ts'
 
 const resumeGraceMs = 60_000
 const closeGraceMs = 1_000
-const orientationSettleMs = 100
+const orientationSettleMs = 40
 
-type Viewer = { socket: WebSocket; id: string }
-type ResumeGrant = { token: string; id: string; expiresAt?: number }
+type ViewerCredential = 'qr' | 'remembered'
+type Viewer = { socket: WebSocket; id: string; credential: ViewerCredential }
+type ResumeGrant = { token: string; id: string; credential: ViewerCredential; expiresAt?: number }
 
 const assets: Record<string, [string, string]> = {
   '/': ['watch.html', 'text/html; charset=utf-8'],
@@ -55,9 +59,14 @@ function readSignal(text: string): Signal | undefined {
 
 export async function startLanServer(
   address: string, directory: string, onOrientation?: (direction: DisplayOrientation) => void, connectionMode?: ConnectionMode,
+  onViewerGone?: (id: string) => void,
+  rememberedComputer?: RememberedComputer,
 ) {
   const hostToken = randomBytes(24).toString('base64url')
   const viewerToken = randomBytes(24).toString('base64url')
+  const { id, name, token } = rememberedComputer ?? {}
+  const remembered = connectionMode === 'lan' && id?.length === 32 && /^[0-9a-f]+$/.test(id) &&
+    token?.length === 32 && /^[A-Za-z0-9_-]+$/.test(token) && name?.trim() ? { id, name, token } : undefined
   const websocket = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 })
   let host: WebSocket | undefined
   let viewer: Viewer | undefined
@@ -91,14 +100,16 @@ export async function startLanServer(
     const { id } = viewer
     viewer = undefined
     send(host, { type: 'viewer-left', id })
+    onViewerGone?.(id)
   }
 
   function approveViewer(current: Viewer, resumeToken: string) {
-    resumeGrant = { token: resumeToken, id: current.id }
+    resumeGrant = { token: resumeToken, id: current.id, credential: current.credential }
     send(current.socket, {
       type: 'approved', id: current.id, resumeToken,
       ...(onOrientation && { followOrientation: true as const }),
       ...(connectionMode && { connectionMode }),
+      ...(remembered && { rememberedComputer: remembered }),
     })
     send(host, { type: 'approved', id: current.id })
   }
@@ -116,11 +127,15 @@ export async function startLanServer(
     const origin = request.headers.origin
     const token = endpoint?.searchParams.get('token')
     const asHost = endpoint?.pathname === '/host' && token === hostToken && (origin === 'file://' || origin === 'null')
-    const asViewer = endpoint?.pathname === '/viewer' && token === viewerToken && origin === `http://${authority}`
+    let viewerCredential: ViewerCredential | undefined
+    if (endpoint?.pathname === '/viewer' && origin === `http://${authority}`) {
+      if (token === viewerToken) viewerCredential = 'qr'
+      else if (remembered && token === remembered.token) viewerCredential = 'remembered'
+    }
     const requestedResume = endpoint?.searchParams.get('resume') ?? null
-    const grant = asViewer && resumeGrant?.token === requestedResume &&
+    const grant = viewerCredential && resumeGrant?.credential === viewerCredential && resumeGrant.token === requestedResume &&
       (resumeGrant.expiresAt === undefined || Date.now() < resumeGrant.expiresAt) ? resumeGrant : undefined
-    if (request.headers.host !== authority || (!asHost && !asViewer) || (asViewer && requestedResume !== null && !grant)) {
+    if (request.headers.host !== authority || (!asHost && !viewerCredential) || (viewerCredential && requestedResume !== null && !grant)) {
       refuseUpgrade(networkSocket, '403 Forbidden')
       return
     }
@@ -132,11 +147,11 @@ export async function startLanServer(
     websocket.handleUpgrade(request, networkSocket, head, (socket) => {
       let orientationTimer: ReturnType<typeof setTimeout> | undefined
       if (asHost) host = socket
-      else {
+      else if (viewerCredential) {
         const previous = viewer?.socket
         removeViewer(previous)
         previous?.close(VIEWER_REPLACED, 'viewer reconnected')
-        viewer = { socket, id: randomUUID() }
+        viewer = { socket, id: randomUUID(), credential: viewerCredential }
         if (grant) {
           send(host, { type: 'viewer-request', id: viewer.id, resumed: true })
           approveViewer(viewer, grant.token)
@@ -197,6 +212,7 @@ export async function startLanServer(
       resolve()
     })
   })
+  const stopAdvertising = remembered && advertiseShare(address, (http.address() as AddressInfo).port, remembered.id)
 
   const heartbeat = setInterval(() => {
     for (const socket of websocket.clients) {
@@ -213,6 +229,9 @@ export async function startLanServer(
   return {
     hostUrl: `ws://${authority}/host?token=${hostToken}`,
     viewerUrl: `http://${authority}/#${viewerToken}`,
+    isViewerApproved(id: string) {
+      return !stopped && !!viewer && viewer.id === id && viewer.socket.readyState === WebSocket.OPEN && resumeGrant?.id === id
+    },
     stop() {
       if (stopped) return stopped
       clearInterval(heartbeat)
@@ -224,7 +243,7 @@ export async function startLanServer(
       const forceClose = setTimeout(() => {
         for (const socket of websocket.clients) socket.terminate()
       }, closeGraceMs)
-      stopped = Promise.all([httpClosed, socketsClosed]).then(() => {
+      stopped = Promise.all([httpClosed, socketsClosed, stopAdvertising?.()]).then(() => {
         clearTimeout(forceClose)
       })
       return stopped

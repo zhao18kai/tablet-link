@@ -84,7 +84,9 @@ internal static class VirtualDisplay
         var center = new Point { X = bounds.Left / 2 + bounds.Right / 2, Y = bounds.Top / 2 + bounds.Bottom / 2 };
         IntPtr monitor = MonitorFromPoint(center, 0);
         var info = new MonitorInfo { Size = Marshal.SizeOf(typeof(MonitorInfo)) };
-        if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info) || (info.Flags & 1) != 0 || !info.Monitor.Equals(bounds)) return 2;
+        if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info) || (info.Flags & 1) != 0 ||
+            !MatchesBounds(info.Monitor, bounds)) return 2;
+        bounds = info.Monitor;
 
         var device = new DisplayDevice { Size = Marshal.SizeOf(typeof(DisplayDevice)) };
         if (!EnumDisplayDevicesW(info.Device, 0, ref device, 1) ||
@@ -140,5 +142,12 @@ internal static class VirtualDisplay
     private static bool ParseCoordinate(string value, out int coordinate)
     {
         return int.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out coordinate);
+    }
+
+    private static bool MatchesBounds(Rect actual, Rect expected)
+    {
+        // Electron's integer DIPs can enclose up to several additional physical pixels.
+        return Math.Abs((long)actual.Left - expected.Left) <= 8 && Math.Abs((long)actual.Top - expected.Top) <= 8 &&
+            Math.Abs((long)actual.Right - expected.Right) <= 8 && Math.Abs((long)actual.Bottom - expected.Bottom) <= 8;
     }
 }

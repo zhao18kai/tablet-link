@@ -1,8 +1,9 @@
 import { selectCaptureSource, type DisplaySide } from './displays.ts'
 import { createDragMotion } from './drag-motion.ts'
-import { createPeer, preferScreenH264, transmit } from './peer.ts'
+import { createPeer, preferScreenCodec, transmit } from './peer.ts'
 import { parsePointerCommand } from './pointer.ts'
-import type { CaptureSource, ConnectionMode, NetworkAddress, Signal, TabletLink } from './wire.ts'
+import { readSavedShare, restoreNetwork, type SavedShare } from './share-preferences.ts'
+import { AUTOMATIC_CAPTURE_EVENT, AUTOMATIC_DISPLAY, type CaptureSource, type ConnectionMode, type NetworkAddress, type Signal, type TabletLink } from './wire.ts'
 
 declare global {
   interface Window { tabletLink: TabletLink }
@@ -31,6 +32,10 @@ const captureSize = document.querySelector<HTMLSelectElement>('#capture-size')!
 const captureFps = document.querySelector<HTMLSelectElement>('#capture-fps')!
 const applyQuality = document.querySelector<HTMLButtonElement>('#apply-quality')!
 const qualityStatus = document.querySelector<HTMLElement>('#quality-status')!
+const startupOption = document.querySelector<HTMLElement>('#startup-option')!
+const launchAtLogin = document.querySelector<HTMLInputElement>('#launch-at-login')!
+const shareAtLogin = document.querySelector<HTMLInputElement>('#share-at-login')!
+const startupStatus = document.querySelector<HTMLElement>('#startup-status')!
 const pageTitle = document.querySelector<HTMLElement>('#page-title')!
 const pages = [...document.querySelectorAll<HTMLButtonElement>('.sidebar-nav button')]
 const preview = document.querySelector<HTMLImageElement>('#source-preview')!
@@ -46,6 +51,12 @@ const reject = document.querySelector<HTMLButtonElement>('#reject')!
 const url = document.querySelector<HTMLInputElement>('#share-url')!
 const qr = document.querySelector<HTMLImageElement>('#qr')!
 const copy = document.querySelector<HTMLButtonElement>('#copy')!
+const automaticSource: CaptureSource = {
+  id: AUTOMATIC_DISPLAY, displayId: '', role: 'extension', name: '自动创建虚拟副屏', thumbnail: '', canRotate: true,
+}
+const loginShareKey = 'tablet-link:share-at-login'
+const savedShareKey = 'tablet-link:last-share'
+shareAtLogin.checked = localStorage.getItem(loginShareKey) === 'true'
 
 let sources: CaptureSource[] = []
 let networks: NetworkAddress[] = []
@@ -69,12 +80,13 @@ function setStatus(message: string, state = 'idle') {
 }
 
 function updateControls() {
-  const sharing = !!stream
+  const sharing = !!socket || !!stream
   modes.disabled = displaySettings.disabled = source.disabled = connectionMode.disabled = refresh.disabled = busy || sharing
   network.disabled = busy || sharing || !network.value
   touchOption.hidden = !extension.checked
   touch.disabled = busy || sharing || !extension.checked
-  orientationOption.hidden = placement.hidden = !extension.checked || !sourceChoice?.canRotate
+  orientationOption.hidden = !extension.checked || !sourceChoice?.canRotate
+  placement.hidden = orientationOption.hidden || sourceChoice === automaticSource
   orientation.disabled = busy || sharing || orientationOption.hidden
   referenceScreen.disabled = displaySide.disabled = applyPosition.disabled = busy || sharing || placement.hidden || !referenceScreen.value
   start.hidden = sharing
@@ -117,7 +129,7 @@ function fillSelect(select: HTMLSelectElement, options: ReadonlyArray<[string, s
 }
 
 function renderSources() {
-  const candidates = sources.filter((item) => !extension.checked || item.role === 'extension')
+  const candidates = extension.checked ? [automaticSource, ...sources.filter(({ role }) => role === 'extension')] : sources
   fillSelect(source, candidates.map(({ name, id }) => [id, name]), extension.checked ? '未检测到扩展屏' : '未找到可共享的屏幕')
   sourceChoice = selectCaptureSource(candidates, sourceChoice)
   if (sourceChoice) source.value = sourceChoice.id
@@ -142,6 +154,7 @@ function renderNetworks() {
 
 function showReadiness() {
   if (!network.value) setStatus(connectionMode.value === 'usb' ? '等待 USB 共享网络' : '请连接局域网后刷新设备')
+  else if (sourceChoice === automaticSource) setStatus('平板获准后将创建副屏')
   else if (source.value) setStatus('可以开始共享')
   else if (extension.checked && !sources.some(({ role }) => role === 'extension')) setStatus('等待 Windows 启用扩展屏')
   else setStatus('请选择要共享的屏幕')
@@ -151,7 +164,7 @@ function scheduleDisplayRefresh() {
   topologyChanged = true
   window.clearTimeout(refreshTimer)
   refreshTimer = window.setTimeout(() => {
-    if (!busy && !stream && topologyChanged) void loadDevices()
+    if (!busy && !socket && !stream && topologyChanged) void loadDevices()
   }, 200)
 }
 
@@ -187,14 +200,47 @@ function closePeer() {
   peer = undefined
 }
 
+function stopCapture() {
+  stream?.getTracks().forEach((track) => track.stop())
+  stream = undefined
+}
+
+async function captureScreen(followOrientation: boolean) {
+  const media = await navigator.mediaDevices.getDisplayMedia({
+    video: captureConstraints(appliedQuality, followOrientation),
+    audio: false,
+  })
+  const [track] = media.getVideoTracks()
+  if (track.readyState === 'ended') {
+    media.getTracks().forEach((item) => item.stop())
+    throw new Error('所选屏幕已停止捕获。')
+  }
+  track.contentHint = 'detail'
+  return media
+}
+
+function captureApprovedDisplay(id: string, followOrientation: boolean) {
+  return new Promise<MediaStream>((resolve, rejectCapture) => {
+    const capture = () => { void captureScreen(followOrientation).then(resolve, rejectCapture) }
+    window.addEventListener(AUTOMATIC_CAPTURE_EVENT, capture, { once: true })
+    void api.captureAutomaticDisplay(id).catch((error: unknown) => {
+      window.removeEventListener(AUTOMATIC_CAPTURE_EVENT, capture)
+      rejectCapture(error)
+    })
+  })
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : fallback
+}
+
 async function endShare(message: string, state = 'idle') {
   const run = ++captureRun
   const currentSocket = socket
   socket = undefined
   currentSocket?.close()
   closePeer()
-  stream?.getTracks().forEach((track) => track.stop())
-  stream = undefined
+  stopCapture()
   requestId = undefined
   request.hidden = details.hidden = true
   instructions.hidden = false
@@ -223,12 +269,16 @@ async function usesUsbAddress(pc: RTCPeerConnection, address: string) {
   return !!pair && report.get(pair.localCandidateId)?.address === address
 }
 
-function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boolean, preferHardwareVideo: boolean, usbAddress?: string) {
+function attachSignaling(
+  channel: WebSocket, allowTouch: boolean, automatic: boolean, followOrientation: boolean,
+  codec?: 'video/VP8' | 'video/H264', usbAddress?: string,
+) {
   let queue = Promise.resolve()
-  const fail = (id: string) => {
+  const fail = (id: string, message = '视频连接失败，请让平板重新请求。') => {
     closePeer()
+    if (automatic) stopCapture()
     transmit(channel, { type: 'reject', id })
-    setStatus('视频连接失败，请让平板重新请求。', 'error')
+    setStatus(message, 'error')
   }
   channel.addEventListener('message', ({ data }) => {
     queue = queue.then(async () => {
@@ -243,16 +293,31 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
         return
       } else if (message.type === 'viewer-left') {
         closePeer()
+        if (automatic) stopCapture()
         requestId = undefined
         request.hidden = true
         if (status.dataset.state !== 'error') setStatus('等待平板连接', 'pending')
       } else if (message.type === 'approved') {
+        if (automatic) {
+          setStatus('正在创建虚拟副屏…', 'pending')
+          const media = await captureApprovedDisplay(message.id, followOrientation)
+          if (socket !== channel) {
+            media.getTracks().forEach((track) => track.stop())
+            return
+          }
+          stream = media
+          media.getVideoTracks()[0].addEventListener('ended', () => {
+            if (socket === channel && stream === media) fail(message.id, '虚拟副屏已断开，请让平板重新请求。')
+          }, { once: true })
+        }
+        const media = stream
+        if (!media) throw new Error('共享画面尚未就绪。')
         const active = createPeer(message.id, (signal) => {
           if (peer === active) transmit(channel, signal)
         }, usbAddress)
         peer = active
         const sender = active.pc.addTrack(media.getVideoTracks()[0], media)
-        if (preferHardwareVideo) preferScreenH264(active.pc, sender)
+        if (codec) preferScreenCodec(active.pc, sender, codec)
         dragMotion = allowTouch ? createDragMotion(sender) : undefined
         active.pc.onconnectionstatechange = async () => {
           if (peer !== active) return
@@ -294,8 +359,8 @@ function attachSignaling(channel: WebSocket, media: MediaStream, allowTouch: boo
         }
         await active.publish('offer')
       } else await peer?.accept(message)
-    }).catch(() => {
-      if (socket === channel && requestId) fail(requestId)
+    }).catch((error: unknown) => {
+      if (socket === channel && requestId) fail(requestId, automatic ? errorMessage(error, '无法创建虚拟副屏。') : undefined)
     })
   })
   channel.addEventListener('close', () => {
@@ -307,33 +372,32 @@ async function beginShare() {
   const selected = sourceChoice
   if (!selected) return
   const run = ++captureRun
+  const automatic = selected === automaticSource
   const allowTouch = extension.checked && touch.checked
-  const followOrientation = extension.checked && selected.canRotate && orientation.checked
+  const rotatable = extension.checked && selected.canRotate
+  const followOrientation = rotatable && orientation.checked
   const mode = connectionMode.value as ConnectionMode
   const address = network.value
+  const adapter = networks.find((item) => item.address === address && item.mode === mode)
   busy = true
   updateControls()
   setStatus('正在启动屏幕共享…', 'pending')
   try {
-    await api.selectSource(selected.id, selected.displayId, extension.checked ? 'extension' : 'screen')
-    if (captureRun !== run) return
-    const media = await navigator.mediaDevices.getDisplayMedia({
-      video: captureConstraints(appliedQuality, followOrientation),
-      audio: false,
-    })
-    if (captureRun !== run) {
-      media.getTracks().forEach((track) => track.stop())
-      return
+    if (!automatic) {
+      await api.selectSource(selected.id, selected.displayId, extension.checked ? 'extension' : 'screen')
+      if (captureRun !== run) return
+      const media = await captureScreen(followOrientation)
+      if (captureRun !== run) {
+        media.getTracks().forEach((track) => track.stop())
+        return
+      }
+      stream = media
+      media.getVideoTracks()[0].addEventListener('ended', () => {
+        if (captureRun === run) void endShare('所选屏幕已停止捕获。', 'error')
+      }, { once: true })
     }
-    stream = media
     captureFollowsOrientation = followOrientation
-    const [track] = media.getVideoTracks()
-    track.contentHint = 'detail'
-    if (track.readyState === 'ended') throw new Error('所选屏幕已停止捕获。')
-    track.addEventListener('ended', () => {
-      if (captureRun === run) void endShare('所选屏幕已停止捕获。', 'error')
-    }, { once: true })
-    const share = await api.start(address, allowTouch, followOrientation, mode)
+    const share = await api.start(address, allowTouch, followOrientation, mode, automatic)
     if (captureRun !== run) return
     const channel = new WebSocket(share.hostUrl)
     socket = channel
@@ -343,24 +407,33 @@ async function beginShare() {
       channel.addEventListener('close', () => rejectOpen(new Error('局域网连接已关闭。')), { once: true })
     })
     if (captureRun !== run) return
-    attachSignaling(channel, media, allowTouch, extension.checked && selected.canRotate, mode === 'usb' ? address : undefined)
+    // VP8 resumes faster when Windows changes the capture dimensions during a rotation.
+    const codec = rotatable ? (followOrientation ? 'video/VP8' : 'video/H264') : undefined
+    attachSignaling(channel, allowTouch, automatic, followOrientation, codec, mode === 'usb' ? address : undefined)
     url.value = share.viewerUrl
     qr.src = share.qr
     instructions.hidden = true
     details.hidden = false
     copy.textContent = '复制链接'
     setStatus('等待平板连接', 'pending')
+    if (adapter) {
+      const saved: SavedShare = {
+        extension: extension.checked, automatic, displayId: selected.displayId, displayName: selected.name,
+        networkName: adapter.name, address, mode, allowTouch, followOrientation,
+      }
+      try { localStorage.setItem(savedShareKey, JSON.stringify(saved)) }
+      catch (error) { console.warn('无法保存上次的共享设置。', error) }
+    }
     busy = false
     updateControls()
   } catch (error) {
     if (captureRun !== run) return
-    const message = error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : '请重试。'
-    await endShare(`无法开始共享。${message}`, 'error')
+    await endShare(`无法开始共享。${errorMessage(error, '请重试。')}`, 'error')
   }
 }
 
 source.addEventListener('change', () => {
-  sourceChoice = sources.find(({ id }) => id === source.value) ?? null
+  sourceChoice = source.value === AUTOMATIC_DISPLAY ? automaticSource : sources.find(({ id }) => id === source.value) ?? null
   positionStatus.textContent = ''
   updatePreview()
   showReadiness()
@@ -443,6 +516,36 @@ applyQuality.addEventListener('click', async () => {
     updateControls()
   }
 })
+async function updateStartupSetting(requested?: boolean) {
+  launchAtLogin.disabled = true
+  startupStatus.textContent = ''
+  try {
+    const enabled = await api.launchAtLogin(requested)
+    startupOption.hidden = enabled === null
+    launchAtLogin.checked = enabled === true
+    shareAtLogin.disabled = enabled !== true
+    if (requested !== undefined && enabled !== requested) startupStatus.textContent = '无法保存自启设置。'
+  } catch {
+    startupOption.hidden = false
+    if (requested !== undefined) launchAtLogin.checked = !requested
+    startupStatus.textContent = requested === undefined ? '无法读取自启设置。' : '无法保存自启设置。'
+  } finally {
+    launchAtLogin.disabled = false
+  }
+  return launchAtLogin.checked
+}
+
+launchAtLogin.addEventListener('change', () => void updateStartupSetting(launchAtLogin.checked))
+shareAtLogin.addEventListener('change', async () => {
+  const requested = shareAtLogin.checked
+  if (requested) {
+    shareAtLogin.disabled = true
+    shareAtLogin.checked = await updateStartupSetting(true)
+  }
+  localStorage.setItem(loginShareKey, String(shareAtLogin.checked))
+})
+window.addEventListener('focus', () => { if (!launchAtLogin.disabled) void updateStartupSetting() })
+void updateStartupSetting()
 void api.getVersion().then((version) => {
   document.querySelector('#app-version')!.textContent = '版本 ' + version
 }).catch(() => {})
@@ -466,8 +569,65 @@ reject.addEventListener('click', () => {
 copy.addEventListener('click', () => void api.copy(url.value).then(() => { copy.textContent = '已复制' }))
 api.onDisplaysChanged(scheduleDisplayRefresh)
 api.onCaptureLost(() => {
+  if (socket && requestId && sourceChoice === automaticSource) {
+    closePeer()
+    stopCapture()
+    transmit(socket, { type: 'reject', id: requestId })
+    setStatus('虚拟副屏已断开，请让平板重新请求。', 'error')
+    return
+  }
   sourceChoice = null
   topologyChanged = true
   void endShare('所选屏幕已断开或退出扩展模式。', 'error')
 })
-void loadDevices()
+api.onDisplayCleanupFailed(() => setStatus('Windows 未能回收自动副屏，请检查 Windows 显示设置。', 'error'))
+
+async function startup() {
+  const initialRun = captureRun
+  let manuallyChanged = false
+  const controls = document.querySelector('#connection')!
+  const markChanged = () => { manuallyChanged = true }
+  controls.addEventListener('change', markChanged)
+  try {
+    await loadDevices()
+    if (!shareAtLogin.checked || !await api.startedAtLogin()) return
+    const saved = readSavedShare(localStorage.getItem(savedShareKey))
+    if (!saved) {
+      setStatus('请先手动开始一次共享，以保存自启设置。')
+      return
+    }
+    for (let attempt = 0; attempt < 6; attempt++) {
+      if (manuallyChanged || captureRun !== initialRun || !shareAtLogin.checked) return
+      const display = saved.automatic && saved.extension ? automaticSource : sources.find((item) =>
+        !!saved.displayId && item.displayId === saved.displayId && item.name === saved.displayName &&
+        (!saved.extension || item.role === 'extension'))
+      const adapter = restoreNetwork(saved, networks)
+      if (display && adapter) {
+        modes.querySelector<HTMLInputElement>(`input[value="${saved.extension ? 'extension' : 'screen'}"]`)!.checked = true
+        sourceChoice = display
+        connectionMode.value = saved.mode
+        renderSources()
+        renderNetworks()
+        network.value = adapter.address
+        touch.checked = saved.allowTouch
+        orientation.checked = saved.followOrientation
+        updateControls()
+        await api.startLoginShare()
+        return
+      }
+      if (attempt < 5) {
+        setStatus('等待上次使用的屏幕和网络…', 'pending')
+        await new Promise((resolve) => window.setTimeout(resolve, 2000))
+        if (manuallyChanged || captureRun !== initialRun || !shareAtLogin.checked) return
+        await loadDevices(false)
+      }
+    }
+    setStatus('找不到上次使用的屏幕或网卡，请重新选择后共享。', 'error')
+  } catch (error) {
+    if (captureRun === initialRun) setStatus(errorMessage(error, '无法自动开始共享。'), 'error')
+  } finally {
+    controls.removeEventListener('change', markChanged)
+  }
+}
+
+void startup()
