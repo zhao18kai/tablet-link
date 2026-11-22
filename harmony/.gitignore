@@ -1,0 +1,13 @@
+/.hvigor/
+/.idea/
+/build/
+/entry/build/
+/oh_modules/
+/entry/oh_modules/
+/local.properties
+*.hap
+*.app
+*.p12
+*.p7b
+*.csr
+*.cer

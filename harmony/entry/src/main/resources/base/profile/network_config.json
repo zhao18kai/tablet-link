@@ -1,0 +1,7 @@
+{
+  "network-security-config": {
+    "component-config": {
+      "ArkWeb": true
+    }
+  }
+}

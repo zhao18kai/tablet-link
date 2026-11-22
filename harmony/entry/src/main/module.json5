@@ -1,0 +1,27 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "mainElement": "ViewerAbility",
+    "deviceTypes": ["tablet"],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "abilities": [{
+      "name": "ViewerAbility",
+      "srcEntry": "./ets/ability/ViewerAbility.ets",
+      "label": "$string:app_name",
+      "icon": "$media:app_icon",
+      "startWindowIcon": "$media:app_icon",
+      "startWindowBackground": "$color:page_background",
+      "exported": true,
+      "supportWindowMode": ["fullscreen", "split", "floating"],
+      "preferMultiWindowOrientation": "landscape_auto",
+      "skills": [{
+        "entities": ["entity.system.home"],
+        "actions": ["action.system.home"]
+      }]
+    }],
+    "requestPermissions": [{ "name": "ohos.permission.INTERNET" }]
+  }
+}
