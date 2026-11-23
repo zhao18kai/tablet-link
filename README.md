@@ -1,5 +1,7 @@
 # 平板智联
 
+> **开发中**。当前公开的是阶段性开发版本，部分功能、设备兼容性和串流性能仍在完善和验证。
+
 Windows 11 局域网副屏工具。电脑采集选中的 Windows 显示器，MatePad 通过浏览器接收。首次连接需在电脑上批准，一次可连接一台平板。
 
 Windows 安装版为 `Tablet-Link-<版本>-Setup-<架构>.exe`。运行安装程序并批准 Windows 管理员授权后，安装程序会使用包内的驱动安装 VDD，并尝试将新虚拟屏配置为备用副屏。已安装的 VDD 会沿用当前配置。Windows 免安装版可完整解压后打开 `Tablet-Link.exe`。 [GitHub Releases](https://github.com/zhao18kai/tablet-link/releases/latest)
