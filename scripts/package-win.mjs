@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url)
 const executable = require('electron')
 const runtime = dirname(executable)
 const { name, productName, version, main } = JSON.parse(await readFile('package.json', 'utf8'))
-const output = join('release', `Tablet-Link-${version}-win32-${process.arch}`)
+const output = process.argv[2] ?? join('release', `Tablet-Link-${version}-win32-${process.arch}`)
 const defaultApp = join(runtime, 'resources', 'default_app.asar')
 const app = join(output, 'resources', 'app')
 

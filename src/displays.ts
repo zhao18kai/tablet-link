@@ -1,3 +1,5 @@
+import { AUTOMATIC_DISPLAY, type CaptureMode, type CaptureSource } from './wire.ts'
+
 interface DisplayPosition {
   id: number
   bounds: { x: number; y: number }
@@ -41,12 +43,20 @@ export function getDisplayRole(id: string, displays: readonly DisplayPosition[],
   return 'extension'
 }
 
-export function selectCaptureSource<Source extends { id: string; displayId: string }>(
+export function selectCaptureSource<Source extends Pick<CaptureSource, 'id' | 'displayId' | 'role' | 'canRotate'>>(
   sources: readonly Source[],
   previous: Source | null | undefined,
+  mode: CaptureMode = 'screen',
+  automaticAvailable = false,
 ): Source | null | undefined {
-  // undefined allows the initial default. null means the user needs to choose again.
+  // Preserve a manual choice across refreshes, including when its display disappears.
   if (previous === null) return null
-  if (!previous) return sources[0]
-  return sources.find((source) => previous.displayId ? source.displayId === previous.displayId : source.id === previous.id) ?? null
+  if (previous) {
+    return sources.find((source) => previous.displayId ? source.displayId === previous.displayId : source.id === previous.id) ?? null
+  }
+  if (mode === 'screen') return sources.find(({ role }) => role === 'primary') ?? sources[0]
+
+  const active = sources.filter(({ id }) => id !== AUTOMATIC_DISPLAY)
+  const automatic = automaticAvailable ? sources.find(({ id }) => id === AUTOMATIC_DISPLAY) : undefined
+  return active.find(({ canRotate }) => canRotate) ?? automatic ?? active[0]
 }

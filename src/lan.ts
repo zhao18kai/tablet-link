@@ -33,13 +33,14 @@ function refuseUpgrade(socket: Duplex, status: '403 Forbidden' | '409 Conflict')
   socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy())
 }
 
-function readSignal(text: string): Signal | undefined {
+export function readSignal(text: string): Signal | undefined {
   try {
     const message = JSON.parse(text) as Signal | null
     if (typeof message?.id !== 'string') return undefined
     switch (message?.type) {
       case 'approve':
       case 'reject':
+      case 'playback-ready':
         return message
       case 'offer':
       case 'answer':
@@ -50,6 +51,9 @@ function readSignal(text: string): Signal | undefined {
         break
       case 'orientation':
         if (message.direction === 'portrait' || message.direction === 'landscape') return message
+        break
+      case 'stream-hud':
+        if (typeof message.visible === 'boolean') return message
         break
     }
   } catch {
@@ -152,9 +156,9 @@ export async function startLanServer(
         removeViewer(previous)
         previous?.close(VIEWER_REPLACED, 'viewer reconnected')
         viewer = { socket, id: randomUUID(), credential: viewerCredential }
-        if (grant) {
+        if (grant || viewerCredential === 'remembered') {
           send(host, { type: 'viewer-request', id: viewer.id, resumed: true })
-          approveViewer(viewer, grant.token)
+          approveViewer(viewer, grant?.token ?? randomBytes(24).toString('base64url'))
         } else send(host, { type: 'viewer-request', id: viewer.id })
       }
 
@@ -191,8 +195,12 @@ export async function startLanServer(
           removeViewer(current.socket)
           current.socket.close()
         } else if (approved) {
-          if (socket === host && (message.type === 'offer' || message.type === 'ice')) send(current.socket, message)
-          if (socket === current.socket && (message.type === 'answer' || message.type === 'ice')) send(host, message)
+          if (socket === host && (message.type === 'offer' || message.type === 'ice' || message.type === 'stream-hud')) {
+            send(current.socket, message)
+          }
+          if (socket === current.socket && (message.type === 'answer' || message.type === 'ice' || message.type === 'playback-ready')) {
+            send(host, message)
+          }
           if (socket === current.socket && message.type === 'orientation' && onOrientation) {
             clearTimeout(orientationTimer)
             orientationTimer = setTimeout(() => {
@@ -231,6 +239,9 @@ export async function startLanServer(
     viewerUrl: `http://${authority}/#${viewerToken}`,
     isViewerApproved(id: string) {
       return !stopped && !!viewer && viewer.id === id && viewer.socket.readyState === WebSocket.OPEN && resumeGrant?.id === id
+    },
+    reconnectViewer(id: string) {
+      if (viewer?.id === id && this.isViewerApproved(id)) viewer.socket.close(1012, 'restart video')
     },
     stop() {
       if (stopped) return stopped

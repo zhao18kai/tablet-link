@@ -1,21 +1,27 @@
 import assert from 'node:assert/strict'
 import test, { type TestContext } from 'node:test'
-import { displayPointerPosition, parsePointerCommand, videoPointerPosition, type PointerCommand } from '../src/pointer.ts'
+import { displayPointerPosition, parsePointerCommand, videoPointerPosition, type PointerCommand, type VideoFit } from '../src/pointer.ts'
 import { createViewerPointer } from '../src/watch-pointer.ts'
 
 const frame = { left: 0, top: 0, width: 900, height: 600 }
 
 test('touches on letterbox bars never reach Windows', () => {
-  assert.equal(videoPointerPosition(frame, 1600, 900, false, 450, 10), undefined)
-  assert.deepEqual(videoPointerPosition(frame, 1600, 900, false, 450, 300), { x: 0.5, y: 0.5 })
-  assert.deepEqual(videoPointerPosition(frame, 1600, 900, false, 450, 610, true), { x: 0.5, y: 1 })
+  assert.equal(videoPointerPosition(frame, 1600, 900, 'contain', 450, 10), undefined)
+  assert.deepEqual(videoPointerPosition(frame, 1600, 900, 'contain', 450, 300), { x: 0.5, y: 0.5 })
+  assert.deepEqual(videoPointerPosition(frame, 1600, 900, 'contain', 450, 610, true), { x: 0.5, y: 1 })
 })
 
-test('fill mode translates visible coordinates into the cropped source', () => {
-  const point = videoPointerPosition(frame, 1600, 900, true, 0, 300)
+test('cropped mode translates visible coordinates into the cropped source', () => {
+  const point = videoPointerPosition(frame, 1600, 900, 'cover', 0, 300)
   assert.ok(point)
   assert.ok(point.x > 0.07 && point.x < 0.08)
   assert.equal(point.y, 0.5)
+})
+
+test('stretching maps all four tablet corners to the matching Windows corners', () => {
+  for (const [x, y] of [[0, 0], [900, 0], [0, 600], [900, 600]]) {
+    assert.deepEqual(videoPointerPosition(frame, 600, 900, 'fill', x, y), { x: x / 900, y: y / 600 })
+  }
 })
 
 test('touch coordinates stay within the chosen display, including negative origins', () => {
@@ -44,7 +50,7 @@ test('the pointer channel accepts only bounded, nonzero integer wheel deltas', (
   assert.equal(parsePointerCommand('{"action":"wheel","x":0,"y":1}'), undefined)
 })
 
-function viewerPointer(t: TestContext, videoWidth = 900, videoHeight = 600) {
+function viewerPointer(t: TestContext, videoWidth = 900, videoHeight = 600, fit: VideoFit = 'contain') {
   const commands: PointerCommand[] = []
   let menus = 0
   let nextFrame = 0
@@ -59,9 +65,9 @@ function viewerPointer(t: TestContext, videoWidth = 900, videoHeight = 600) {
   })
   t.after(() => { Reflect.deleteProperty(globalThis, 'window') })
   const area = Object.assign(new EventTarget(), { classList: { toggle() {} }, setPointerCapture() {} })
-  const video = { videoWidth, videoHeight, classList: { contains: () => false }, getBoundingClientRect: () => frame }
+  const video = { videoWidth, videoHeight, getBoundingClientRect: () => frame }
   const pointer = createViewerPointer(area as unknown as HTMLElement, video as unknown as HTMLVideoElement,
-    (command) => commands.push(command), () => { menus++ })
+    (command) => commands.push(command), () => { menus++ }, () => fit)
   pointer.setEnabled(true)
   return {
     ...pointer,
@@ -79,6 +85,13 @@ function viewerPointer(t: TestContext, videoWidth = 900, videoHeight = 600) {
     get menus() { return menus },
   }
 }
+
+test('tapping a stretched video edge sends an edge tap to Windows', (t) => {
+  const pointer = viewerPointer(t, 600, 900, 'fill')
+  pointer.emit('down', 1, 0, 0)
+  pointer.emit('up', 1, 0, 0)
+  assert.deepEqual(pointer.commands, [{ action: 'down', x: 0, y: 0 }, { action: 'up', x: 0, y: 0 }])
+})
 
 test('vertical touch travel scrolls at the midpoint in both directions', (t) => {
   const pointer = viewerPointer(t)

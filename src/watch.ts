@@ -1,4 +1,5 @@
 import { createPeer, transmit } from './peer.ts'
+import type { VideoFit } from './pointer.ts'
 import { createViewerPointer } from './watch-pointer.ts'
 import { createRotationTransition } from './watch-rotation.ts'
 import { createStreamStats } from './watch-stats.ts'
@@ -6,14 +7,18 @@ import { SHARE_ENDED, VIEWER_LEAVING, VIEWER_REPLACED, type Signal } from './wir
 
 declare global {
   interface Window {
-    tabletLinkReceiver?: { rememberComputer(id: string, name: string, token: string): void }
+    tabletLinkReceiver?: {
+      rememberComputer(id: string, name: string, token: string): void
+      setFullscreen?(fullscreen: boolean): boolean
+    }
   }
 }
 
 const [, token, reconnect] = /^#([A-Za-z0-9_-]{32})(\.reconnect)?$/.exec(location.hash) ?? []
 const button = document.querySelector<HTMLButtonElement>('#connect')!
 const full = document.querySelector<HTMLButtonElement>('#fullscreen')!
-const fit = document.querySelector<HTMLButtonElement>('#fit')!
+const fit = document.querySelector<HTMLSelectElement>('#fit')!
+const receiverBuffer = document.querySelector<HTMLSelectElement>('#receiver-buffer')!
 const leave = document.querySelector<HTMLButtonElement>('#leave')!
 const stage = document.querySelector<HTMLElement>('#stage')!
 const toolbar = document.querySelector<HTMLElement>('#viewer-bar')!
@@ -34,8 +39,14 @@ let resumeToken: string | undefined
 let retryDeadline = 0
 let retryCount = 0
 let touchChannel: RTCDataChannel | undefined
+let videoReceiver: RTCRtpReceiver | undefined
 let touchEnabled = false
 let followOrientation = false
+let fitOverride: VideoFit | undefined
+let nativeFullscreen = false
+let previousFullscreen = false
+let autoFullscreen = Boolean(reconnect)
+let showStreamHud = true
 
 function reportOrientation() {
   if (!followOrientation || !channel || !activePeer) return
@@ -51,8 +62,8 @@ const remotePointer = createViewerPointer(video.parentElement!, video, (command)
   if ((command.action === 'move' || command.action === 'wheel') && touchChannel.bufferedAmount > 4096) return
   touchChannel.send(JSON.stringify(command))
 }, () => {
-  if (document.fullscreenElement === stage) setControlsVisible(toolbar.hidden === true)
-})
+  if (prompt.hidden === true) setControlsVisible(toolbar.hidden === true)
+}, currentVideoFit)
 const rotation = createRotationTransition(video, document.querySelector<HTMLCanvasElement>('#rotation-frame')!, (waiting) => {
   remotePointer.setEnabled(touchEnabled && !waiting && !!channel)
 })
@@ -61,17 +72,50 @@ function setControlsVisible(visible: boolean) {
   toolbar.hidden = !visible
   surface.setAttribute('aria-expanded', String(visible))
   surface.setAttribute('aria-label', visible ? '隐藏全屏控件' : '显示全屏控件')
+  streamStats.setVisible(visible && showStreamHud && prompt.hidden === true)
+}
+
+function isFullscreen() {
+  return nativeFullscreen || document.fullscreenElement === stage
+}
+
+function currentVideoFit(): VideoFit {
+  return fitOverride ?? (isFullscreen() ? 'fill' : 'contain')
+}
+
+function setNativeFullscreen(fullscreen: boolean) {
+  try {
+    if (!reconnect || window.tabletLinkReceiver?.setFullscreen?.(fullscreen) !== true) return false
+  } catch {
+    return false
+  }
+  nativeFullscreen = fullscreen
+  updateFullscreen()
+  return true
+}
+
+async function exitFullscreen() {
+  if (nativeFullscreen) setNativeFullscreen(false)
+  else if (document.fullscreenElement === stage) await document.exitFullscreen()
 }
 
 function updateFullscreen() {
-  const fullscreen = document.fullscreenElement === stage
-  const immersive = fullscreen && prompt.hidden
+  const fullscreen = isFullscreen()
+  const fullscreenChanged = previousFullscreen !== fullscreen
+  previousFullscreen = fullscreen
+  const playing = prompt.hidden === true
+  const startedPlaying = playing && !stage.classList.contains('viewer-playing')
+  stage.classList.toggle('native-fullscreen', nativeFullscreen)
+  stage.classList.toggle('viewer-playing', playing)
+  fit.value = currentVideoFit()
   const keyboardEntry = document.activeElement === full && full.matches(':focus-visible')
   const restoreFocus = document.activeElement === surface
-  surface.hidden = !immersive || touchEnabled
-  setControlsVisible(!immersive)
+  surface.hidden = !playing || touchEnabled
+  if (!playing || (fullscreenChanged && !fullscreen)) setControlsVisible(true)
+  else if (startedPlaying || fullscreenChanged) setControlsVisible(false)
   full.textContent = fullscreen ? '退出全屏' : '全屏'
-  full.disabled = !fullscreen && (!activePeer || !prompt.hidden || !document.fullscreenEnabled)
+  const canFullscreen = document.fullscreenEnabled || Boolean(reconnect && window.tabletLinkReceiver?.setFullscreen)
+  full.disabled = !fullscreen && (!activePeer || !prompt.hidden || !canFullscreen)
   if (!full.disabled) full.removeAttribute('title')
   if (!surface.hidden && keyboardEntry) surface.focus()
   else if (!fullscreen && restoreFocus && !full.disabled) full.focus()
@@ -94,6 +138,7 @@ function resetConnection(closeCode?: number) {
   rotation.clear()
   remotePointer.setEnabled(false)
   touchChannel = undefined
+  videoReceiver = undefined
   activePeer?.pc.close()
   activePeer = undefined
   previous?.close(closeCode)
@@ -104,6 +149,7 @@ function resetConnection(closeCode?: number) {
   streamStats.reset()
   prompt.hidden = false
   fit.hidden = true
+  receiverBuffer.hidden = true
   updateTouchMode()
 }
 
@@ -136,7 +182,7 @@ function end(message: string, closeCode?: number) {
   resumeToken = undefined
   retryDeadline = 0
   retryCount = 0
-  if (document.fullscreenElement === stage) void document.exitFullscreen().catch(() => {})
+  void exitFullscreen().catch(() => {})
   status.textContent = message
   button.hidden = false
   button.disabled = false
@@ -177,6 +223,16 @@ async function play() {
   }
 }
 
+function applyReceiverBuffer() {
+  if (!videoReceiver || !('jitterBufferTarget' in videoReceiver)) return false
+  try {
+    videoReceiver.jitterBufferTarget = receiverBuffer.value === 'auto' ? null : Number(receiverBuffer.value)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function connect(resuming = false) {
   if (activePeer && video.srcObject) {
     void play()
@@ -198,7 +254,7 @@ function connect(resuming = false) {
   socket.addEventListener('open', () => {
     if (channel !== socket) return
     opened = true
-    if (!resuming) {
+    if (!resuming && !reconnect) {
       window.clearTimeout(timer)
       status.textContent = '请在电脑端允许连接。'
     }
@@ -273,15 +329,17 @@ function connect(resuming = false) {
         }
         peer.pc.ontrack = ({ track, streams, receiver }) => {
           if (activePeer !== peer) return
-          try {
-            if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0
-          } catch {
-            // Browsers without a usable setter keep their own adaptive buffer.
-          }
+          videoReceiver = receiver
+          applyReceiverBuffer()
           video.srcObject = streams[0] ?? new MediaStream([track])
           void play()
         }
       } else if (activePeer?.id === message.id) {
+        if (message.type === 'stream-hud') {
+          showStreamHud = message.visible
+          streamStats.setVisible(showStreamHud && prompt.hidden === true && !toolbar.hidden)
+          return
+        }
         const peer = activePeer
         await peer.accept(message)
         if (message.type === 'offer' && activePeer === peer) await peer.publish('answer')
@@ -299,23 +357,30 @@ video.addEventListener('playing', () => {
   retryCount = 0
   const firstPlayback = !prompt.hidden
   if (firstPlayback && followOrientation) rotation.start(portraitViewport.matches ? 'portrait' : 'landscape')
+  if (firstPlayback && channel) transmit(channel, { type: 'playback-ready', id: activePeer.id })
   prompt.hidden = true
-  streamStats.show()
   fit.hidden = false
+  receiverBuffer.hidden = !applyReceiverBuffer()
+  if (firstPlayback && autoFullscreen) {
+    autoFullscreen = false
+    if (!isFullscreen() && !setNativeFullscreen(true) && document.fullscreenEnabled) {
+      void stage.requestFullscreen({ navigationUI: 'hide' }).catch(() => {})
+    }
+  }
   if (firstPlayback) updateTouchMode()
 })
 
 window.setInterval(async () => {
   const peer = activePeer
-  if (!peer || streamHud.hidden) return
+  if (!peer || !prompt.hidden) return
   const report = await peer.pc.getStats().catch(() => undefined)
-  if (report && activePeer === peer && !streamHud.hidden) streamStats.update(report)
+  if (report && activePeer === peer && prompt.hidden) streamStats.update(report)
 }, 1000)
 
 full.addEventListener('click', async () => {
   try {
-    if (document.fullscreenElement === stage) await document.exitFullscreen()
-    else await stage.requestFullscreen({ navigationUI: 'hide' })
+    if (isFullscreen()) await exitFullscreen()
+    else if (!setNativeFullscreen(true)) await stage.requestFullscreen({ navigationUI: 'hide' })
   } catch {
     full.title = '当前浏览器无法进入全屏'
     full.textContent = '全屏不可用'
@@ -323,9 +388,17 @@ full.addEventListener('click', async () => {
   }
 })
 document.addEventListener('fullscreenchange', updateFullscreen)
+window.addEventListener('tablet-link-native-fullscreen-exit', () => {
+  nativeFullscreen = false
+  updateFullscreen()
+})
 surface.addEventListener('click', () => setControlsVisible(toolbar.hidden === true))
-fit.addEventListener('click', () => {
-  fit.setAttribute('aria-pressed', String(video.classList.toggle('video-cover')))
+receiverBuffer.addEventListener('change', applyReceiverBuffer)
+fit.addEventListener('change', () => {
+  const mode = fit.value
+  if (mode !== 'fill' && mode !== 'contain' && mode !== 'cover') return
+  fitOverride = mode
+  stage.dataset.videoFit = mode
 })
 leave.addEventListener('click', () => end('已断开连接。', VIEWER_LEAVING))
 window.addEventListener('pagehide', () => {
@@ -338,7 +411,7 @@ if (!token || typeof RTCPeerConnection !== 'function') {
 } else {
   button.addEventListener('click', () => {
     // Browsers require the gesture that opened the connection to request fullscreen.
-    if (!document.fullscreenElement && document.fullscreenEnabled) {
+    if (!isFullscreen() && !setNativeFullscreen(true) && document.fullscreenEnabled) {
       void stage.requestFullscreen({ navigationUI: 'hide' }).catch(() => {})
     }
     void requestConnection()

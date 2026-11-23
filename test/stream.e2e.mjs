@@ -5,12 +5,304 @@ import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { _electron, chromium } from 'playwright-core'
 import { build } from 'esbuild'
 
 test('Windows screen reaches a separate Chromium browser over a LAN address', { timeout: 60000 }, (t) => streamScreen(t))
 test('an extended Windows display sends its own desktop to the receiver', { timeout: 60000 }, (t) => streamScreen(t, true))
+
+test('new desktop profiles start with a 120 FPS capture cap', { timeout: 20000 }, async (t) => {
+  const app = await launchHost(t)
+  const host = await app.firstWindow()
+  await host.getByRole('button', { name: '画质设置' }).click()
+  assert.equal(await host.locator('#capture-fps').inputValue(), '120')
+})
+
+test('native 1080p video and touch connect through the desktop share and recover using browser capture', { timeout: 90000 }, async (t) => {
+  const ffmpeg = process.env.TABLET_LINK_TEST_FFMPEG
+  if (!ffmpeg) return t.skip('TABLET_LINK_TEST_FFMPEG was not configured')
+  const result = await connectNativeExperiment(t, ffmpeg)
+  if (!result) return
+  const { app, host, viewer } = result
+  await host.getByText('正在向平板传输原生画面（目标 1080p60）').waitFor({ timeout: 10000 })
+  await viewer.locator('.screen.touch-enabled').waitFor({ timeout: 10000 })
+  assert.equal(await viewer.locator('#viewer-bar').isVisible(), false)
+  assert.equal(await viewer.locator('#stream-hud').isVisible(), false)
+  await twoFingerTap(viewer)
+  await viewer.locator('#stream-hud').waitFor({ state: 'visible' })
+  await viewer.waitForFunction(() => ['stream-received-fps', 'stream-fps', 'stream-presented-fps']
+    .every((id) => /\d+ FPS/.test(document.getElementById(id)?.textContent ?? '')))
+  const nativeStats = await viewer.evaluate(async () => {
+    const report = await window.nativeTestPeer.getStats()
+    const inbound = [...report.values()].find((entry) => entry.type === 'inbound-rtp' && entry.kind === 'video')
+    return { codec: report.get(inbound.codecId).mimeType, width: inbound.frameWidth, height: inbound.frameHeight }
+  })
+  assert.deepEqual(nativeStats, { codec: 'video/H264', width: 1920, height: 1080 })
+  const setBuffer = (value) => viewer.locator('#receiver-buffer').evaluate((field, value) => {
+    field.value = value
+    field.dispatchEvent(new Event('change'))
+    return window.nativeTestPeer.getReceivers()[0].jitterBufferTarget
+  }, value)
+  assert.equal(await setBuffer('20'), 20)
+  assert.equal(await setBuffer('auto'), null)
+  assert.equal(await setBuffer('0'), 0)
+
+  await new Promise((resolve) => setTimeout(resolve, 12000))
+  assert.match(await host.locator('#status').innerText(), /正在向平板传输原生画面/)
+  const readings = await viewer.locator('#stream-received-fps, #stream-fps, #stream-presented-fps').allTextContents()
+  t.diagnostic(`Native 1080p capture on local Edge (received / decoded / presented): ${readings.join(' / ')}`)
+  await viewer.evaluate(() => { window.nativeSource = document.querySelector('video').srcObject })
+  const pid = await app.evaluate(() => process.pid)
+  const stop = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+    `$child = Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${pid} AND Name = ''ffmpeg.exe''' | Select-Object -First 1; if (!$child) { exit 2 }; Stop-Process -Id $child.ProcessId -ErrorAction Stop`],
+    { windowsHide: true, timeout: 10000 })
+  assert.equal(stop.status, 0, stop.stderr?.toString() || 'The test encoder should have started')
+  try {
+    await host.getByText('正在向平板传输画面（已回退到普通模式）').waitFor({ timeout: 23000 })
+  } catch (error) {
+    t.diagnostic(`Fallback host status: ${await host.locator('#status').textContent()}; viewer status: ${await viewer.locator('#status').textContent()}`)
+    throw error
+  }
+  await viewer.waitForFunction(() => {
+    const video = document.querySelector('video')
+    return video.srcObject && video.srcObject !== window.nativeSource && video.currentTime > .25
+  }, undefined, { timeout: 15000 })
+  await viewer.locator('.screen.touch-enabled').waitFor({ timeout: 10000 })
+  assert.equal(await host.getByRole('button', { name: '允许连接' }).isVisible(), false)
+  await host.getByRole('button', { name: '停止共享' }).click()
+})
+
+test('native mode falls back when no FFmpeg executable is configured', { timeout: 65000 }, async (t) => {
+  const result = await connectNativeExperiment(t, join(tmpdir(), 'tablet-link-missing-encoder', 'ffmpeg.exe'))
+  if (!result) return
+  const { host, viewer } = result
+  await host.getByText('正在向平板传输画面（已回退到普通模式）').waitFor({ timeout: 10000 })
+  await viewer.locator('.screen.touch-enabled').waitFor({ timeout: 10000 })
+  await host.getByRole('button', { name: '停止共享' }).click()
+})
+
+test('native mode publishes the selected 120 FPS target on a high-refresh display', { timeout: 65000 }, async (t) => {
+  const ffmpeg = process.env.TABLET_LINK_TEST_FFMPEG
+  if (!ffmpeg) return t.skip('TABLET_LINK_TEST_FFMPEG was not configured')
+  const result = await connectNativeExperiment(t, ffmpeg, 120)
+  if (!result) return
+  const { host, viewer } = result
+  await host.getByText('正在向平板传输原生画面（目标 1080p120）').waitFor({ timeout: 10000 })
+  await viewer.locator('.screen.touch-enabled').waitFor({ timeout: 10000 })
+  await twoFingerTap(viewer)
+  await viewer.locator('#stream-hud').waitFor({ state: 'visible' })
+  await viewer.waitForFunction(() => ['stream-received-fps', 'stream-fps', 'stream-presented-fps']
+    .every((id) => /\d+ FPS/.test(document.getElementById(id)?.textContent ?? '')))
+  const resolution = await viewer.locator('#stage video').evaluate((video) => [video.videoWidth, video.videoHeight])
+  assert.deepEqual(resolution, [1920, 1080])
+  const levels = await viewer.evaluate(() => window.nativeTestPeer.remoteDescription.sdp)
+  assert.match(levels, /profile-level-id=42e033/)
+  await host.getByRole('button', { name: '画质设置' }).click()
+  const decodedFrames = () => viewer.evaluate(async () => [...(await window.nativeTestPeer.getStats()).values()]
+    .find((entry) => entry.type === 'inbound-rtp' && entry.kind === 'video')?.framesDecoded ?? 0)
+  const startingFrames = await decodedFrames()
+  await new Promise((resolve) => setTimeout(resolve, 4000))
+  const frames = await viewer.locator('#stream-received-fps, #stream-fps, #stream-presented-fps').allTextContents()
+  t.diagnostic(`120 FPS target (encoder / received / decoded / presented): ${await host.locator('#host-stream-fps').textContent()} / ${frames.join(' / ')}`)
+  assert.ok(await decodedFrames() >= startingFrames + 60, 'the native stream should keep decoding frames')
+  await host.getByRole('button', { name: '屏幕连接' }).click()
+  await host.getByRole('button', { name: '停止共享' }).click()
+})
+
+async function connectNativeExperiment(t, ffmpeg, fps = 60) {
+  const app = await launchHost(t, { TABLET_LINK_FFMPEG: ffmpeg })
+  const host = await app.firstWindow()
+  const vdd = await host.evaluate(async () => (await window.tabletLink.sources()).find(({ canRotate }) => canRotate))
+  if (!vdd) {
+    t.skip('No active VDD extension for the native experiment')
+    return
+  }
+  const suitable = await app.evaluate(({ screen }, { id, fps }) => {
+    const display = screen.getAllDisplays().find(({ id: item }) => String(item) === id)
+    if (!display) return false
+    const { width, height } = screen.dipToScreenRect(null, display.bounds)
+    const tolerance = Math.ceil(display.scaleFactor) + 1
+    return Math.abs(width - 1920) <= tolerance && Math.abs(height - 1080) <= tolerance &&
+      display.displayFrequency >= (fps === 120 ? 119.5 : 59)
+  }, { id: vdd.displayId, fps })
+  if (!suitable) {
+    t.skip(`The native experiment needs a fixed 1920 × 1080 VDD at ${fps} Hz or higher`)
+    return
+  }
+  await app.evaluate(async ({ BrowserWindow, screen }, id) => {
+    const display = screen.getAllDisplays().find(({ id: item }) => String(item) === id)
+    const marker = new BrowserWindow({
+      x: display.bounds.x + 16, y: display.bounds.y + 16, width: 320, height: 64,
+      show: false, frame: false, focusable: false, alwaysOnTop: true, skipTaskbar: true,
+    })
+    marker.setIgnoreMouseEvents(true)
+    await marker.loadURL('data:text/html,' + encodeURIComponent('<style>body{background:#125075}' +
+      'div{width:80px;height:44px;background:#ffd850;animation:move .35s linear infinite alternate}' +
+      '@keyframes move{to{transform:translateX(212px)}}</style><div></div>'))
+    marker.showInactive()
+  }, vdd.displayId)
+  await host.getByRole('button', { name: '画质设置' }).click()
+  await host.getByRole('checkbox', { name: '原生高帧率', exact: true }).check()
+  if (await host.locator('#capture-fps').inputValue() !== String(fps)) {
+    await host.locator('#capture-fps').selectOption(String(fps))
+    await host.getByRole('button', { name: '应用' }).click()
+    await host.getByText('已保存，下次共享时生效').waitFor()
+  }
+  await host.getByRole('button', { name: '屏幕连接' }).click()
+  await host.getByRole('radio', { name: '扩展副屏' }).check()
+  await host.locator('#source').selectOption(vdd.id)
+  await host.getByRole('checkbox', { name: '跟随平板横竖屏' }).uncheck()
+  const browser = await chromium.launch({ executablePath: edgeExecutable() })
+  t.after(() => browser.close())
+  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 }, hasTouch: true })
+  await viewer.addInitScript(() => {
+    const Original = window.RTCPeerConnection
+    window.RTCPeerConnection = class extends Original {
+      constructor(...args) {
+        super(...args)
+        window.nativeTestPeer = this
+      }
+    }
+  })
+  await host.getByRole('button', { name: '开始共享' }).click()
+  const link = host.locator('#share-url')
+  await link.waitFor({ timeout: 12000 })
+  const url = await link.inputValue()
+  assert.ok(url, await host.locator('#status').innerText())
+  await viewer.goto(url)
+  await viewer.getByRole('button', { name: '请求观看' }).click()
+  await host.getByRole('button', { name: '允许连接' }).click()
+  await viewer.waitForFunction(() => document.querySelector('video').currentTime > .25, undefined, { timeout: 26000 })
+  return { app, host, viewer }
+}
+
+test('fullscreen fills the tablet viewport with all four source corners visible', { timeout: 20000 }, async (t) => {
+  const browser = await chromium.launch({ executablePath: edgeExecutable() })
+  t.after(() => browser.close())
+  const viewer = await browser.newPage({ viewport: { width: 900, height: 600 } })
+  const executable = process.env.TABLET_LINK_EXE
+  const page = executable ? pathToFileURL(join(dirname(executable), 'resources', 'app', 'dist', 'watch.html'))
+    : new URL('../dist/watch.html', import.meta.url)
+  await viewer.goto(page.href)
+  await viewer.evaluate(async () => {
+    const source = document.createElement('canvas')
+    source.width = 600
+    source.height = 900
+    const context = source.getContext('2d')
+    context.fillStyle = '#141414'
+    context.fillRect(0, 0, source.width, source.height)
+    for (const [color, x, y] of [['#ff0000', 0, 0], ['#00ff00', 540, 0], ['#0000ff', 0, 810], ['#ffff00', 540, 810]]) {
+      context.fillStyle = color
+      context.fillRect(x, y, 60, 90)
+    }
+    const video = document.querySelector('video')
+    video.srcObject = source.captureStream(5)
+    await video.play()
+    const stage = document.querySelector('#stage')
+    stage.addEventListener('click', () => {
+      document.querySelector('#viewer-prompt').hidden = true
+      document.querySelector('#fit').hidden = false
+      void stage.requestFullscreen()
+    }, { once: true })
+  })
+  await viewer.locator('#viewer-prompt p').click()
+  await viewer.getByRole('button', { name: '显示全屏控件' }).waitFor()
+  const fit = viewer.locator('#fit')
+  const video = viewer.locator('video')
+  const objectFit = () => video.evaluate((element) => getComputedStyle(element).objectFit)
+  assert.equal(await objectFit(), 'fill')
+  const corners = await viewer.evaluate(async (encoded) => {
+    const image = new Image()
+    image.src = `data:image/png;base64,${encoded}`
+    await image.decode()
+    const canvas = document.createElement('canvas')
+    canvas.width = image.width
+    canvas.height = image.height
+    const context = canvas.getContext('2d')
+    context.drawImage(image, 0, 0)
+    return [[10, 10], [image.width - 10, 10], [10, image.height - 10], [image.width - 10, image.height - 10]]
+      .map(([x, y]) => Array.from(context.getImageData(x, y, 1, 1).data).slice(0, 3).map((channel) => channel > 128 ? 255 : 0))
+  }, (await viewer.screenshot()).toString('base64'))
+  assert.deepEqual(corners, [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]])
+  await viewer.getByRole('button', { name: '显示全屏控件' }).click()
+  assert.equal(await fit.inputValue(), 'fill')
+  for (const mode of ['contain', 'cover', 'fill']) {
+    await fit.selectOption(mode)
+    assert.equal(await objectFit(), mode)
+    assert.equal(await viewer.locator('#rotation-frame').evaluate((canvas) => getComputedStyle(canvas).objectFit), mode)
+  }
+})
+
+test('recent connections play and enter tablet fullscreen without clicking desktop approval', { timeout: 60000 }, async (t) => {
+  const app = await launchHost(t)
+  const host = await app.firstWindow()
+  const browser = await chromium.launch({ executablePath: edgeExecutable() })
+  t.after(() => browser.close())
+  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 } })
+  await viewer.addInitScript(() => {
+    window.tabletLinkReceiver = {
+      rememberComputer(_id, _name, token) { window.testRememberedToken = token },
+      setFullscreen(fullscreen) {
+        window.testTabletFullscreen = fullscreen
+        return true
+      },
+    }
+  })
+  const start = host.getByRole('button', { name: '开始共享' })
+  const stop = host.getByRole('button', { name: '停止共享' })
+  const approve = host.getByRole('button', { name: '允许连接' })
+  const shareUrl = host.locator('#share-url')
+  const video = viewer.locator('video')
+  const showHud = host.getByRole('checkbox', { name: '显示副屏悬浮窗' })
+  const streamHud = viewer.locator('#stream-hud')
+  assert.ok(await showHud.isChecked())
+  await start.click()
+  await shareUrl.waitFor()
+  await viewer.goto(await shareUrl.inputValue())
+  await viewer.getByRole('button', { name: '请求观看' }).click()
+  await approve.waitFor()
+  assert.equal(await video.evaluate((element) => element.srcObject), null)
+  await approve.click()
+  await viewer.waitForFunction(() => window.testRememberedToken)
+  const rememberedToken = await viewer.evaluate(() => window.testRememberedToken)
+  await viewer.getByRole('button', { name: '显示全屏控件' }).click()
+  await streamHud.waitFor({ state: 'visible' })
+  await video.evaluate((element) => { window.testStreamBeforeHudChange = element.srcObject })
+  await showHud.uncheck()
+  await streamHud.waitFor({ state: 'hidden' })
+  assert.equal(await video.evaluate((element) => element.srcObject === window.testStreamBeforeHudChange), true)
+
+  await stop.click()
+  await shareUrl.waitFor({ state: 'hidden' })
+  await host.reload()
+  assert.equal(await showHud.isChecked(), false)
+  await start.click()
+  await shareUrl.waitFor()
+  const recent = new URL(await shareUrl.inputValue())
+  recent.hash = `${rememberedToken}.reconnect`
+  await viewer.goto(recent.href)
+  await viewer.waitForFunction(() => document.querySelector('video').videoWidth > 0 && window.testTabletFullscreen === true)
+  assert.equal(await approve.isVisible(), false)
+  assert.equal(await video.evaluate((element) => getComputedStyle(element).objectFit), 'fill')
+  assert.equal(await streamHud.isVisible(), false)
+  await showHud.check()
+  await viewer.getByRole('button', { name: '显示全屏控件' }).click()
+  await streamHud.waitFor({ state: 'visible' })
+  await viewer.waitForFunction(() => /\d+ FPS/.test(document.querySelector('#stream-fps').textContent))
+  await viewer.getByRole('button', { name: '退出全屏' }).click()
+  assert.equal(await viewer.evaluate(() => window.testTabletFullscreen), false)
+  assert.equal(await video.evaluate((element) => getComputedStyle(element).objectFit), 'contain')
+
+  await viewer.getByRole('button', { name: '全屏', exact: true }).click()
+  assert.equal(await viewer.evaluate(() => window.testTabletFullscreen), true)
+  await viewer.evaluate(() => {
+    window.testTabletFullscreen = false
+    window.dispatchEvent(new Event('tablet-link-native-fullscreen-exit'))
+  })
+  assert.ok(await viewer.getByRole('button', { name: '全屏', exact: true }).isVisible())
+  await stop.click()
+})
 
 test('the startup checkbox updates the Windows login entry', { timeout: 30000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'Tablet Link startup test '))
@@ -73,32 +365,40 @@ test('automatic extension waits for approval and releases its session when the v
     ? join(dirname(executable), 'resources', 'app', 'dist', 'tablet-pointer.exe')
     : fileURLToPath(new URL('../dist/tablet-pointer.exe', import.meta.url))
   const probe = spawnSync(helper, ['--probe-display'], { windowsHide: true })
-  assert.ok(probe.status === 0 || probe.status === 10, 'Windows must report whether it has a standby VDD output')
+  assert.ok([0, 10, 13].includes(probe.status), 'Windows must report whether it has a standby VDD output')
   const app = await launchHost(t)
-  const browser = await chromium.launch({ executablePath: edgeExecutable() })
-  t.after(() => browser.close())
   const host = await app.firstWindow()
-  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 } })
   const displayIds = () => app.evaluate(({ screen }) =>
     (globalThis.realDisplays?.() ?? screen.getAllDisplays()).map(({ id }) => id).sort())
   const original = await displayIds()
 
   await host.getByRole('radio', { name: '扩展副屏' }).check()
-  assert.equal(await host.locator('#source').inputValue(), 'automatic-display')
-  await host.getByRole('button', { name: '开始共享' }).click()
-  await host.locator('#share-details').waitFor({ state: 'visible' })
-  const approve = host.getByRole('button', { name: '允许连接' })
-  const status = (text) => host.waitForFunction((expected) => document.querySelector('#status').textContent.includes(expected), text)
-  await viewer.goto(await host.locator('#share-url').inputValue())
-  await viewer.getByRole('button', { name: '请求观看' }).click()
-  await approve.waitFor({ state: 'visible' })
-  assert.deepEqual(await displayIds(), original)
-  assert.equal(await viewer.locator('video').evaluate((video) => video.srcObject), null)
+  const source = host.locator('#source')
+  const current = await host.evaluate(async () => (await window.tabletLink.sources()).filter(({ role }) => role === 'extension'))
+  const preferred = current.find(({ canRotate }) => canRotate)?.id ?? (probe.status === 0 ? 'automatic-display' : current[0]?.id ?? '')
+  assert.equal(await source.inputValue(), preferred)
+  await source.selectOption('automatic-display')
+  const touch = host.getByRole('checkbox', { name: '允许平板触控' })
+  assert.equal(await touch.isChecked(), true)
+  await touch.uncheck()
+  const start = host.getByRole('button', { name: '开始共享' })
+  const details = host.locator('#share-details')
+  const status = (text) => host.waitForFunction((expected) => document.querySelector('#status').textContent.includes(expected), text,
+    { timeout: 5000 })
+
+  if (probe.status !== 0) {
+    await start.click()
+    await status(probe.status === 13 ? '未检测到 VDD by MTT' : '没有可用的备用虚拟屏')
+    assert.equal(await details.isVisible(), false)
+    assert.deepEqual(await displayIds(), original)
+    if (probe.status === 13) {
+      assert.ok(await host.getByRole('button', { name: '获取 VDD 驱动' }).isEnabled())
+      t.diagnostic('No supported VDD monitor is present. The host reports the missing driver output before pairing.')
+      return
+    }
+  }
 
   if (probe.status === 10) {
-    await approve.click()
-    await status('没有可用的备用虚拟屏')
-    assert.deepEqual(await displayIds(), original)
     t.diagnostic('No physical standby output. The retry exercises real Electron capture with a simulated driver session.')
     await app.evaluate(({ screen }) => {
       const target = screen.getAllDisplays().find((display) => display.label === 'VDD by MTT' && display.id !== screen.getPrimaryDisplay().id)
@@ -112,6 +412,9 @@ test('automatic extension waits for approval and releases its session when the v
       screen.getAllDisplays = () => globalThis.testLease.opened > globalThis.testLease.closed
         ? realDisplays() : realDisplays().filter(({ id }) => id !== target.id)
       children.spawn = function (file, args, options) {
+        if (args?.[0] === '--probe-display') {
+          return spawn(process.execPath, ['-e', ''], { ...options, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
+        }
         if (args?.[0] !== '--lease-display') return spawn(file, args, options)
         globalThis.testLease.opened++
         const child = spawn(process.execPath, ['-e', `console.log('READY ${x} ${y} ${width - 1} ${height}'); process.stdin.resume()`],
@@ -124,10 +427,20 @@ test('automatic extension waits for approval and releases its session when the v
       t.diagnostic('No active MTT VDD output for the simulated driver session.')
       return
     }
-    await viewer.getByRole('button', { name: '重新连接' }).click()
-    await approve.waitFor({ state: 'visible' })
-    assert.deepEqual(await app.evaluate(() => globalThis.testLease), { opened: 0, closed: 0 })
   }
+
+  await start.click()
+  await details.waitFor({ state: 'visible' })
+  const browser = await chromium.launch({ executablePath: edgeExecutable() })
+  t.after(() => browser.close())
+  const viewer = await browser.newPage({ viewport: { width: 1200, height: 800 } })
+  const approve = host.getByRole('button', { name: '允许连接' })
+  await viewer.goto(await host.locator('#share-url').inputValue())
+  await viewer.getByRole('button', { name: '请求观看' }).click()
+  await approve.waitFor({ state: 'visible' })
+  assert.deepEqual(await displayIds(), original)
+  assert.equal(await viewer.locator('video').evaluate((video) => video.srcObject), null)
+  if (probe.status === 10) assert.deepEqual(await app.evaluate(() => globalThis.testLease), { opened: 0, closed: 0 })
 
   await approve.click()
   await viewer.waitForFunction(() => document.querySelector('video').videoWidth > 0, undefined, { timeout: 18000 })
@@ -139,7 +452,27 @@ test('automatic extension waits for approval and releases its session when the v
     assert.deepEqual(await app.evaluate(() => globalThis.testLease), { opened: 1, closed: 0 })
   }
   await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
-  await viewer.getByRole('button', { name: '显示全屏控件' }).click()
+  const controls = viewer.getByRole('button', { name: '显示全屏控件' })
+  const fit = viewer.locator('#fit')
+  const videoFit = () => viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit)
+  assert.equal(await videoFit(), 'fill', 'entering fullscreen should fill the viewport without cropping')
+  const rotationFit = () => viewer.locator('#rotation-frame').evaluate((canvas) => getComputedStyle(canvas).objectFit)
+  assert.equal(await rotationFit(), 'fill')
+  await controls.click()
+  assert.equal(await fit.inputValue(), 'fill')
+  await viewer.getByRole('button', { name: '退出全屏' }).click()
+  await viewer.waitForFunction(() => document.fullscreenElement === null)
+  assert.equal(await videoFit(), 'contain')
+
+  await viewer.getByRole('button', { name: '全屏', exact: true }).click()
+  await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage')
+  assert.equal(await videoFit(), 'fill')
+  await controls.click()
+  await fit.selectOption('cover')
+  assert.equal(await videoFit(), 'cover')
+  assert.equal(await rotationFit(), 'cover')
+  await fit.selectOption('contain')
+  assert.equal(await videoFit(), 'contain')
   await viewer.locator('#leave').click()
   await status('等待平板连接')
   for (let attempt = 0; attempt < 50; attempt++) {
@@ -161,7 +494,7 @@ function edgeExecutable() {
   return edge
 }
 
-async function launchHost(t) {
+async function launchHost(t, environment) {
   const executablePath = process.env.TABLET_LINK_EXE
   const profile = await mkdtemp(join(tmpdir(), 'tablet-link-e2e-'))
   let app
@@ -171,6 +504,7 @@ async function launchHost(t) {
   })
   app = await _electron.launch({
     args: [...(executablePath ? [] : ['.']), `--user-data-dir=${profile}`],
+    env: environment ? { ...process.env, ...environment } : process.env,
     executablePath,
     timeout: 20000,
   })
@@ -215,8 +549,10 @@ async function verifyRotation(t, browser, useFallback) {
     const orientation = matchMedia('(orientation: portrait)')
     orientation.addEventListener('change', () => transition.start(orientation.matches ? 'portrait' : 'landscape'))
     const full = document.querySelector('#fullscreen')
+    const stage = document.querySelector('#stage')
+    stage.dataset.videoFit = 'contain'
     full.disabled = false
-    full.addEventListener('click', () => document.querySelector('#stage').requestFullscreen())
+    full.addEventListener('click', () => stage.requestFullscreen())
     document.querySelector('#viewer-prompt').hidden = true
     function draw(width, height, color, blackEdge = false, markBottom = false) {
       source.width = width
@@ -433,7 +769,7 @@ async function streamScreen(t, extension = false) {
     const listed = await host.locator('#source option').evaluateAll((options) => options.map(({ value }) => value))
     assert.deepEqual(listed, ['automatic-display', ...extendedDisplays.map(({ id }) => id)])
     await host.locator('#source').selectOption(target.id)
-    await host.getByRole('checkbox', { name: '允许平板触控' }).check()
+    assert.equal(await host.getByRole('checkbox', { name: '允许平板触控' }).isChecked(), true)
 
     // Draw a test color on the selected display so a duplicate of the primary cannot pass.
     await app.evaluate(async ({ BrowserWindow, screen }, displayId) => {
@@ -481,6 +817,13 @@ async function streamScreen(t, extension = false) {
   await viewer.waitForFunction(() => document.fullscreenElement?.id === 'stage', undefined, { timeout: 2500 })
   t.diagnostic(`Decoded ${dimensions.join(' × ')} video from Windows screen capture`)
   const streamHud = viewer.locator('#stream-hud')
+  await streamHud.waitFor({ state: 'hidden' })
+  const toggleControls = async () => {
+    if (extension) await twoFingerTap(viewer)
+    else await viewer.locator('#viewer-surface').tap()
+  }
+  if (extension) await viewer.locator('.screen.touch-enabled').waitFor({ timeout: 10000 })
+  await toggleControls()
   await streamHud.waitFor({ state: 'visible' })
   await viewer.waitForFunction(() => /\d+ FPS/.test(document.querySelector('#stream-hud').textContent))
   assert.match(await streamHud.innerText(), /串流中.*Wi-Fi \/ 局域网/s)
@@ -494,8 +837,12 @@ async function streamScreen(t, extension = false) {
     }
     return false
   })
+  await toggleControls()
+  await streamHud.waitFor({ state: 'hidden' })
 
   await navigation.getByRole('button', { name: '画质设置' }).click()
+  await host.waitForFunction(() => /采集 \d+ FPS · 发送 \d+ FPS/.test(document.querySelector('#host-stream-fps')?.textContent ?? ''),
+    undefined, { timeout: 6000 })
   const resolutionLimit = host.getByLabel('采集分辨率上限')
   const frameLimit = host.getByLabel('最高帧率')
   const initialLimits = [await resolutionLimit.inputValue(), await frameLimit.inputValue()]
@@ -534,7 +881,8 @@ async function streamScreen(t, extension = false) {
       await new Promise((resolve) => setTimeout(resolve, 1500))
       return Math.round(1000 * (video.getVideoPlaybackQuality().totalVideoFrames - initial) / (performance.now() - start))
     })
-    t.diagnostic(`Received about ${measuredFrames} FPS with continuous screen motion`)
+    const senderFps = await host.locator('#host-stream-fps').textContent()
+    t.diagnostic(`Continuous motion: ${senderFps} · playback received about ${measuredFrames} FPS`)
     const center = await videoCenter(viewer)
     await viewer.touchscreen.tap(center.x, center.y)
     await markerPage.waitForFunction(() => document.body.dataset.clicks === '1', undefined, { timeout: 6000 })
@@ -565,18 +913,18 @@ async function streamScreen(t, extension = false) {
   }
 
   await viewer.locator('.viewer-bar').waitFor({ state: 'hidden', timeout: 3000 })
-  assert.ok(await streamHud.isVisible())
+  assert.equal(await streamHud.isVisible(), false)
   assert.equal(await streamHud.evaluate((node) => getComputedStyle(node).pointerEvents), 'none')
-  const fit = viewer.getByRole('button', { name: '铺满画面（裁边）' })
+  const fit = viewer.locator('#fit')
   const surface = viewer.getByRole('button', { name: '显示全屏控件' })
   if (extension) await twoFingerTap(viewer)
   else await surface.tap()
-  assert.equal(await fit.getAttribute('aria-pressed'), 'false')
-  assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
-  await fit.tap()
-  assert.equal(await fit.getAttribute('aria-pressed'), 'true')
+  await streamHud.waitFor({ state: 'visible' })
+  assert.equal(await fit.inputValue(), 'fill')
+  assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'fill')
+  await fit.selectOption('cover')
   assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'cover')
-  await fit.tap()
+  await fit.selectOption('contain')
   assert.equal(await viewer.locator('video').evaluate((video) => getComputedStyle(video).objectFit), 'contain')
   if (extension) await twoFingerTap(viewer)
   else await viewer.getByRole('button', { name: '隐藏全屏控件' }).tap()
@@ -633,6 +981,8 @@ async function streamScreen(t, extension = false) {
   t.diagnostic('A manual reconnect waits for the previous socket to close and requests approval again')
 
   await host.getByRole('button', { name: '停止共享' }).click()
+  await navigation.getByRole('button', { name: '画质设置' }).click()
+  assert.equal(await host.locator('#host-stream-fps').textContent(), '')
   await viewer.waitForFunction(() => document.querySelector('video').srcObject === null)
   await viewer.waitForFunction(() => document.fullscreenElement === null)
   await assert.rejects(fetch(url))

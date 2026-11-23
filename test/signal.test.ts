@@ -101,18 +101,25 @@ test('a single viewer can exchange media signals only after desktop approval', a
   const messages: string[] = []
   viewer.socket.on('message', (data) => messages.push(JSON.parse(data.toString()).type))
   const offer = { type: 'offer', id, description: { type: 'offer', sdp: 'example' } }
+  const hideHud = { type: 'stream-hud', id, visible: false }
   host.socket.send(JSON.stringify(offer))
+  host.socket.send(JSON.stringify(hideHud))
   const approved = receive(viewer.socket)
   host.socket.send(JSON.stringify({ type: 'approve', id }))
   assert.equal((await approved).type, 'approved')
   assert.deepEqual(messages, ['approved'])
 
   const forwardedOffer = receive(viewer.socket)
+  host.socket.send(JSON.stringify({ ...hideHud, visible: 'false' }))
+  host.socket.send(JSON.stringify({ ...hideHud, id: 'old-viewer' }))
+  host.socket.send(JSON.stringify(hideHud))
   host.socket.send(JSON.stringify(offer))
-  assert.deepEqual(await forwardedOffer, offer)
+  assert.deepEqual(await forwardedOffer, hideHud)
+  assert.deepEqual(messages.slice(0, 2), ['approved', 'stream-hud'])
 
   const forwardedAnswer = receive(host.socket)
   const answer = { type: 'answer', id, description: { type: 'answer', sdp: 'example' } }
+  viewer.socket.send(JSON.stringify(hideHud))
   viewer.socket.send(JSON.stringify(answer))
   assert.deepEqual(await forwardedAnswer, answer)
 
@@ -311,7 +318,7 @@ test('the QR token alone still requires approval and a new approval revokes the 
   await assert.rejects(connect(first.resumeUrl, viewerUrl.origin).opened, /403/)
 })
 
-test('a remembered computer can be requested on a new share but only streams after fresh approval', { timeout: 5000 }, async (t) => {
+test('a remembered tablet starts streaming on a new share without another desktop approval', { timeout: 5000 }, async (t) => {
   const remembered = { id: 'a'.repeat(32), name: 'Windows PC', token: 'r'.repeat(32) }
   const first = await setup(t, undefined, undefined, remembered)
   const firstHost = connect(first.server.hostUrl, 'null')
@@ -341,19 +348,22 @@ test('a remembered computer can be requested on a new share but only streams aft
 
   const secondRequest = receive(secondHost.socket)
   const secondViewer = connect(reconnectUrl, second.viewerUrl.origin)
+  const secondApproval = receive(secondViewer.socket)
   await secondViewer.opened
   const request = await secondRequest
   const { id } = request
-  assert.deepEqual(request, { type: 'viewer-request', id })
-  assert.equal(second.server.isViewerApproved(id), false)
-  const secondApproval = receive(secondViewer.socket)
-  secondHost.socket.send(JSON.stringify({ type: 'offer', id, description: { type: 'offer', sdp: 'pending' } }))
-  secondHost.socket.send(JSON.stringify({ type: 'approve', id }))
+  assert.equal(second.server.isViewerApproved(id), true)
+  assert.deepEqual(request, { type: 'viewer-request', id, resumed: true })
   const confirmation = await secondApproval
   assert.equal(confirmation.type, 'approved')
-  assert.equal(second.server.isViewerApproved(id), true)
   assert.deepEqual(confirmation.rememberedComputer, remembered)
   assert.notEqual(confirmation.resumeToken, remembered.token)
+  await assert.rejects(connect(reconnectUrl, second.viewerUrl.origin).opened, /409/)
+
+  const forwardedOffer = receive(secondViewer.socket)
+  const offer = { type: 'offer', id, description: { type: 'offer', sdp: 'remembered' } }
+  secondHost.socket.send(JSON.stringify(offer))
+  assert.deepEqual(await forwardedOffer, offer)
 
   const wrongCredential = new URL(second.viewerWs)
   wrongCredential.searchParams.set('resume', confirmation.resumeToken)

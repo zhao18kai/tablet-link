@@ -6,7 +6,19 @@ interface Sample {
   id: string
   time: number
   decoded: number
+  received?: number
+  presented?: number
   bytes?: number
+  buffered?: number
+  emitted?: number
+}
+
+function counterDelta(previous: number | undefined, current: number | undefined) {
+  return previous !== undefined && current !== undefined && current >= previous ? current - previous : undefined
+}
+
+function displayFps(frames: number | undefined, seconds: number) {
+  return (frames === undefined ? '—' : Math.round(frames / seconds)) + ' FPS'
 }
 
 function createFpsHistory(canvas: HTMLCanvasElement) {
@@ -89,10 +101,31 @@ export function createStreamStats(hud: HTMLElement, video: HTMLVideoElement) {
   const codec = hud.querySelector<HTMLElement>('#stream-codec')!
   const resolution = hud.querySelector<HTMLElement>('#stream-resolution')!
   const fps = hud.querySelector<HTMLElement>('#stream-fps')!
+  const receivedFps = hud.querySelector<HTMLElement>('#stream-received-fps')!
+  const presentedFps = hud.querySelector<HTMLElement>('#stream-presented-fps')!
   const bitrate = hud.querySelector<HTMLElement>('#stream-bitrate')!
   const roundTrip = hud.querySelector<HTMLElement>('#stream-rtt')!
+  const bufferDelay = hud.querySelector<HTMLElement>('#stream-buffer-delay')!
   const history = createFpsHistory(hud.querySelector<HTMLCanvasElement>('#stream-history')!)
   let sample: Sample | undefined
+  let frameCallback: number | undefined
+  let presentedFrames: number | undefined
+
+  function observePresentation() {
+    if (frameCallback !== undefined || !video.requestVideoFrameCallback) return
+    frameCallback = video.requestVideoFrameCallback((_time, frame) => {
+      frameCallback = undefined
+      presentedFrames = frame.presentedFrames
+      if (!hud.hidden) observePresentation()
+    })
+  }
+
+  function stopPresentation() {
+    if (frameCallback !== undefined) video.cancelVideoFrameCallback?.(frameCallback)
+    frameCallback = presentedFrames = undefined
+    if (sample) sample.presented = undefined
+    presentedFps.textContent = '— FPS'
+  }
 
   function updateResolution() {
     const { videoWidth, videoHeight } = video
@@ -109,8 +142,13 @@ export function createStreamStats(hud: HTMLElement, video: HTMLVideoElement) {
 
   return {
     setInterrupted,
-    show() {
-      hud.hidden = false
+    setVisible(visible: boolean) {
+      hud.hidden = !visible
+      if (!visible) {
+        stopPresentation()
+        return
+      }
+      observePresentation()
       updateResolution()
       history.draw()
     },
@@ -119,8 +157,11 @@ export function createStreamStats(hud: HTMLElement, video: HTMLVideoElement) {
       setInterrupted(false)
       codec.hidden = true
       fps.textContent = '— FPS'
+      receivedFps.textContent = '— FPS'
+      stopPresentation()
       bitrate.textContent = '— Mb/s'
       roundTrip.textContent = '— ms'
+      bufferDelay.textContent = '— ms'
       history.clear()
       sample = undefined
     },
@@ -135,22 +176,34 @@ export function createStreamStats(hud: HTMLElement, video: HTMLVideoElement) {
         id: inbound.id,
         time: inbound.timestamp,
         decoded: inbound.framesDecoded,
+        received: Number.isFinite(inbound.framesReceived) ? inbound.framesReceived : undefined,
+        presented: presentedFrames,
         bytes: Number.isFinite(inbound.bytesReceived) ? inbound.bytesReceived : undefined,
+        buffered: Number.isFinite(inbound.jitterBufferDelay) ? inbound.jitterBufferDelay : undefined,
+        emitted: Number.isFinite(inbound.jitterBufferEmittedCount) ? inbound.jitterBufferEmittedCount : undefined,
       }
       const previous = sample
       if (previous?.id === current.id && current.time <= previous.time) return
       sample = current
       if (previous && previous.id === current.id && current.decoded >= previous.decoded) {
         const seconds = (current.time - previous.time) / 1000
-        const framesPerSecond = Math.round((current.decoded - previous.decoded) / seconds)
-        fps.textContent = framesPerSecond + ' FPS'
-        history.append(current.time, framesPerSecond)
+        const presented = counterDelta(previous.presented, current.presented)
+        fps.textContent = displayFps(current.decoded - previous.decoded, seconds)
+        receivedFps.textContent = displayFps(counterDelta(previous.received, current.received), seconds)
+        presentedFps.textContent = displayFps(presented, seconds)
+        if (presented !== undefined) history.append(current.time, Math.round(presented / seconds))
+        const buffered = counterDelta(previous.buffered, current.buffered)
+        const emitted = counterDelta(previous.emitted, current.emitted)
+        bufferDelay.textContent = emitted && buffered !== undefined ? Math.round(buffered * 1000 / emitted) + ' ms' : '— ms'
         if (current.bytes !== undefined && previous.bytes !== undefined && current.bytes >= previous.bytes) {
           bitrate.textContent = ((current.bytes - previous.bytes) * 8 / seconds / 1_000_000).toFixed(1) + ' Mb/s'
         } else bitrate.textContent = '— Mb/s'
       } else {
         fps.textContent = '— FPS'
+        receivedFps.textContent = '— FPS'
+        presentedFps.textContent = '— FPS'
         bitrate.textContent = '— Mb/s'
+        bufferDelay.textContent = '— ms'
         history.clear()
         history.draw()
       }

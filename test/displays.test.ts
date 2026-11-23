@@ -31,9 +31,29 @@ test('a missing primary or stale screen ID cannot be used as an extension', () =
   assert.equal(getDisplayRole('3', displays, 5), 'unknown')
 })
 
+test('sharing an existing screen selects the primary monitor by default', () => {
+  const primary = { id: 'screen:0:0', displayId: '10', role: 'primary', canRotate: false } as const
+  const external = { id: 'screen:1:0', displayId: '11', role: 'extension', canRotate: false } as const
+
+  assert.equal(selectCaptureSource([external, primary], undefined, 'screen'), primary)
+  assert.equal(selectCaptureSource([external, primary], external, 'screen'), external)
+})
+
+test('extension mode matches an active VDD, a usable automatic output, or a physical extension', () => {
+  const automatic = { id: 'automatic-display', displayId: '', role: 'extension', canRotate: true } as const
+  const virtual = { id: 'screen:1:0', displayId: '11', role: 'extension', canRotate: true } as const
+  const external = { id: 'screen:2:0', displayId: '12', role: 'extension', canRotate: false } as const
+
+  assert.equal(selectCaptureSource([automatic, external, virtual], undefined, 'extension', false), virtual)
+  assert.equal(selectCaptureSource([automatic, external], undefined, 'extension', true), automatic)
+  assert.equal(selectCaptureSource([automatic, external], undefined, 'extension', false), external)
+  assert.equal(selectCaptureSource([automatic], undefined, 'extension', false), undefined)
+  assert.equal(selectCaptureSource([automatic, virtual], automatic, 'extension', true), automatic)
+})
+
 test('a removed display stays unselected across refreshes until a new selection is made', () => {
-  const first = { id: 'screen:2:0', displayId: '11' }
-  const other = { id: 'screen:2:0', displayId: '12' }
+  const first = { id: 'screen:2:0', displayId: '11', role: 'extension', canRotate: false } as const
+  const other = { id: 'screen:2:0', displayId: '12', role: 'extension', canRotate: false } as const
   const selection = selectCaptureSource([], first)
 
   assert.equal(selection, null)
@@ -42,8 +62,8 @@ test('a removed display stays unselected across refreshes until a new selection 
 })
 
 test('the selected screen is matched by display ID after Electron renumbers its source', () => {
-  const previous = { id: 'screen:2:0', displayId: '11' }
-  const newTarget = { id: 'screen:3:0', displayId: '11' }
+  const previous = { id: 'screen:2:0', displayId: '11', role: 'extension', canRotate: false } as const
+  const newTarget = { ...previous, id: 'screen:3:0' }
   assert.equal(selectCaptureSource([newTarget], previous), newTarget)
 })
 

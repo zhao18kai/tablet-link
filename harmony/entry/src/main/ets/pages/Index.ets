@@ -12,13 +12,19 @@ const bridgeName = 'tabletLinkReceiver'
 
 class ReceiverBridge {
   private readonly onApproval: (id: string, name: string, token: string) => void
+  private readonly onFullscreen: (fullscreen: boolean) => boolean
 
-  constructor(onApproval: (id: string, name: string, token: string) => void) {
+  constructor(onApproval: (id: string, name: string, token: string) => void, onFullscreen: (fullscreen: boolean) => boolean) {
     this.onApproval = onApproval
+    this.onFullscreen = onFullscreen
   }
 
   rememberComputer(id: string, name: string, token: string): void {
     this.onApproval(id, name, token)
+  }
+
+  setFullscreen(fullscreen: boolean): boolean {
+    return this.onFullscreen(fullscreen)
   }
 }
 
@@ -37,6 +43,7 @@ struct Index {
   @State private historyFailed: boolean = false
   private controller: webview.WebviewController = new webview.WebviewController()
   private exitHandler: FullScreenExitHandler | null = null
+  private windowUpdate: Promise<void> = Promise.resolve()
   private history: preferences.Preferences | null = null
   private bridge: ReceiverBridge | null = null
   private discovery: ComputerDiscovery = new ComputerDiscovery(
@@ -99,6 +106,10 @@ struct Index {
     this.bridge = new ReceiverBridge((id: string, name: string, token: string) => {
       if (this.controller !== controller || this.destination !== link || (rememberedId && rememberedId !== id)) return
       this.saveComputer(id, name, token)
+    }, (fullscreen: boolean): boolean => {
+      if (!rememberedId || this.controller !== controller || this.destination !== link) return false
+      this.setViewerFullscreen(fullscreen)
+      return true
     })
     this.discovery.stop()
     this.message = ''
@@ -130,7 +141,7 @@ struct Index {
     const permission = '{"javascriptProxyPermission":{"urlPermissionList":[' +
       `{"scheme":"http","host":"${authority[0]}","port":"${authority[1]}","path":""}]}}`
     try {
-      this.controller.registerJavaScriptProxy(this.bridge, bridgeName, ['rememberComputer'], [], permission)
+      this.controller.registerJavaScriptProxy(this.bridge, bridgeName, ['rememberComputer', 'setFullscreen'], [], permission)
     } catch {
       this.historyFailed = true
     }
@@ -177,20 +188,37 @@ struct Index {
     }
   }
 
+  private setViewerFullscreen(fullscreen: boolean): void {
+    this.viewingFullScreen = fullscreen
+    this.windowUpdate = this.windowUpdate.then(() => this.updateWindow())
+  }
+
+  private async exitNativeFullscreen(): Promise<void> {
+    this.setViewerFullscreen(false)
+    try {
+      await this.controller.runJavaScript('window.dispatchEvent(new Event("tablet-link-native-fullscreen-exit"))')
+    } catch {
+      // The receiver page may already have been closed.
+    }
+  }
+
   private backToConnect(): void {
-    this.viewingFullScreen = false
     this.exitHandler = null
     this.detachBridge()
     this.destination = ''
     this.loadFailed = false
     this.input = ''
     this.startDiscovery()
-    void this.updateWindow()
+    this.setViewerFullscreen(false)
   }
 
   onBackPress(): boolean {
     if (this.exitHandler) {
       this.exitHandler.exitFullScreen()
+      return true
+    }
+    if (this.viewingFullScreen) {
+      void this.exitNativeFullscreen()
       return true
     }
     if (this.destination) {
@@ -296,13 +324,11 @@ struct Index {
         })
         .onFullScreenEnter((event) => {
           this.exitHandler = event.handler
-          this.viewingFullScreen = true
-          void this.updateWindow()
+          this.setViewerFullscreen(true)
         })
         .onFullScreenExit(() => {
           this.exitHandler = null
-          this.viewingFullScreen = false
-          void this.updateWindow()
+          this.setViewerFullscreen(false)
         })
     }
     .width('100%').height('100%').backgroundColor('#101916')

@@ -69,6 +69,84 @@ internal static class VirtualDisplay
     [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     private static extern int ChangeDisplaySettingsExW(string device, ref DisplayMode mode, IntPtr window, uint flags, IntPtr reserved);
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DxgiOutput
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Device;
+        public Rect Desktop;
+        public int Attached;
+        public int Rotation;
+        public IntPtr Monitor;
+    }
+
+    [DllImport("dxgi.dll", ExactSpelling = true)]
+    private static extern int CreateDXGIFactory1(ref Guid iid, out IntPtr factory);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int Enumerate(IntPtr self, uint index, out IntPtr item);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int DescribeOutput(IntPtr self, out DxgiOutput description);
+
+    private static IntPtr DxgiMethod(IntPtr item, int index)
+    {
+        return Marshal.ReadIntPtr(Marshal.ReadIntPtr(item), index * IntPtr.Size);
+    }
+
+    public static int FindDxgiOutput(string[] args)
+    {
+        var bounds = new Rect();
+        if (args.Length != 5 || !ParseCoordinate(args[1], out bounds.Left) ||
+            !ParseCoordinate(args[2], out bounds.Top) || !ParseCoordinate(args[3], out bounds.Right) ||
+            !ParseCoordinate(args[4], out bounds.Bottom) || bounds.Left >= bounds.Right || bounds.Top >= bounds.Bottom) return 1;
+
+        var center = new Point { X = bounds.Left / 2 + bounds.Right / 2, Y = bounds.Top / 2 + bounds.Bottom / 2 };
+        IntPtr monitor = MonitorFromPoint(center, 0);
+        var info = new MonitorInfo { Size = Marshal.SizeOf(typeof(MonitorInfo)) };
+        if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info) || (info.Flags & 1) != 0 ||
+            !MatchesBounds(info.Monitor, bounds)) return 2;
+
+        var iid = new Guid("770aae78-f26f-4dba-a829-253c83d1b387");
+        IntPtr factory;
+        if (CreateDXGIFactory1(ref iid, out factory) != 0) return 3;
+        try
+        {
+            // IDXGIFactory1::EnumAdapters1, then IDXGIAdapter::EnumOutputs and IDXGIOutput::GetDesc.
+            var enumerateAdapters = (Enumerate)Marshal.GetDelegateForFunctionPointer(DxgiMethod(factory, 12), typeof(Enumerate));
+            for (uint adapterIndex = 0; ; adapterIndex++)
+            {
+                IntPtr adapter;
+                if (enumerateAdapters(factory, adapterIndex, out adapter) != 0) break;
+                try
+                {
+                    var enumerateOutputs = (Enumerate)Marshal.GetDelegateForFunctionPointer(DxgiMethod(adapter, 7), typeof(Enumerate));
+                    for (uint outputIndex = 0; ; outputIndex++)
+                    {
+                        IntPtr output;
+                        if (enumerateOutputs(adapter, outputIndex, out output) != 0) break;
+                        try
+                        {
+                            DxgiOutput description;
+                            var describe = (DescribeOutput)Marshal.GetDelegateForFunctionPointer(DxgiMethod(output, 7), typeof(DescribeOutput));
+                            if (describe(output, out description) != 0 || description.Attached == 0 ||
+                                description.Rotation != 1 || description.Monitor != monitor ||
+                                !String.Equals(description.Device, info.Device, StringComparison.OrdinalIgnoreCase) ||
+                                !MatchesBounds(description.Desktop, info.Monitor)) continue;
+                            Console.WriteLine("{0} {1} {2} {3}", adapterIndex, outputIndex,
+                                description.Desktop.Right - description.Desktop.Left,
+                                description.Desktop.Bottom - description.Desktop.Top);
+                            return 0;
+                        }
+                        finally { Marshal.Release(output); }
+                    }
+                }
+                finally { Marshal.Release(adapter); }
+            }
+        }
+        finally { Marshal.Release(factory); }
+        return 4;
+    }
+
     public static int Change(string[] args)
     {
         bool placing = args[0] == "--place-display";

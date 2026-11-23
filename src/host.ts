@@ -3,7 +3,7 @@ import { createDragMotion } from './drag-motion.ts'
 import { createPeer, preferScreenCodec, transmit } from './peer.ts'
 import { parsePointerCommand } from './pointer.ts'
 import { readSavedShare, restoreNetwork, type SavedShare } from './share-preferences.ts'
-import { AUTOMATIC_CAPTURE_EVENT, AUTOMATIC_DISPLAY, type CaptureSource, type ConnectionMode, type NetworkAddress, type Signal, type TabletLink } from './wire.ts'
+import { AUTOMATIC_CAPTURE_EVENT, AUTOMATIC_DISPLAY, type CaptureSource, type ConnectionMode, type NativeVideoMode, type NetworkAddress, type Signal, type TabletLink } from './wire.ts'
 
 declare global {
   interface Window { tabletLink: TabletLink }
@@ -16,7 +16,9 @@ const touchOption = document.querySelector<HTMLLabelElement>('#touch-option')!
 const touch = document.querySelector<HTMLInputElement>('#allow-touch')!
 const orientationOption = document.querySelector<HTMLLabelElement>('#orientation-option')!
 const orientation = document.querySelector<HTMLInputElement>('#follow-orientation')!
+const showStreamHud = document.querySelector<HTMLInputElement>('#show-stream-hud')!
 const displaySettings = document.querySelector<HTMLButtonElement>('#display-settings')!
+const vddDriver = document.querySelector<HTMLButtonElement>('#vdd-driver')!
 const displayHint = document.querySelector<HTMLElement>('#display-hint')!
 const source = document.querySelector<HTMLSelectElement>('#source')!
 const network = document.querySelector<HTMLSelectElement>('#network')!
@@ -32,6 +34,11 @@ const captureSize = document.querySelector<HTMLSelectElement>('#capture-size')!
 const captureFps = document.querySelector<HTMLSelectElement>('#capture-fps')!
 const applyQuality = document.querySelector<HTMLButtonElement>('#apply-quality')!
 const qualityStatus = document.querySelector<HTMLElement>('#quality-status')!
+const senderFps = document.querySelector<HTMLElement>('#host-stream-fps')!
+const nativeSettings = document.querySelector<HTMLElement>('#native-settings')!
+const nativeMode = document.querySelector<HTMLInputElement>('#native-capture')!
+const chooseFfmpeg = document.querySelector<HTMLButtonElement>('#choose-native-ffmpeg')!
+const ffmpegStatus = document.querySelector<HTMLElement>('#native-ffmpeg-status')!
 const startupOption = document.querySelector<HTMLElement>('#startup-option')!
 const launchAtLogin = document.querySelector<HTMLInputElement>('#launch-at-login')!
 const shareAtLogin = document.querySelector<HTMLInputElement>('#share-at-login')!
@@ -56,17 +63,41 @@ const automaticSource: CaptureSource = {
 }
 const loginShareKey = 'tablet-link:share-at-login'
 const savedShareKey = 'tablet-link:last-share'
+const streamHudKey = 'tablet-link:show-stream-hud'
+const nativeCaptureKey = 'tablet-link:native-capture'
+const matePadAspectRatio = 2456 / 1600
 shareAtLogin.checked = localStorage.getItem(loginShareKey) === 'true'
+showStreamHud.checked = localStorage.getItem(streamHudKey) !== 'false'
+nativeMode.checked = localStorage.getItem(nativeCaptureKey) === 'true'
+
+interface SenderFrameSample {
+  id: string
+  sourceId: string
+  time: number
+  captured: number
+  sent: number
+}
 
 let sources: CaptureSource[] = []
 let networks: NetworkAddress[] = []
 let sourceChoice: CaptureSource | null | undefined
+let sourcePreference: CaptureSource | null | undefined
+let automaticAvailable = false
 let stream: MediaStream | undefined
 let captureFollowsOrientation = false
 let applyingQuality = false
 let appliedQuality = { size: restoreQuality(captureSize), fps: restoreQuality(captureFps) }
 let socket: WebSocket | undefined
 let peer: ReturnType<typeof createPeer> | undefined
+let nativePeer: {
+  id: string
+  mode: NativeVideoMode
+  streaming: boolean
+  playbackTimer: number
+  recover(): void
+  frameSample?: { time: number; frames: number }
+} | undefined
+let senderFrameSample: SenderFrameSample | undefined
 let dragMotion: ReturnType<typeof createDragMotion> | undefined
 let busy = false
 let requestId: string | undefined
@@ -93,6 +124,7 @@ function updateControls() {
   start.disabled = busy || applyingQuality || !source.value || !network.value
   stop.hidden = !sharing
   stop.disabled = busy
+  nativeMode.disabled = chooseFfmpeg.disabled = busy || sharing
   captureSize.disabled = captureFps.disabled = applyingQuality
   applyQuality.disabled = busy || applyingQuality ||
     (captureSize.value === appliedQuality.size && captureFps.value === appliedQuality.fps)
@@ -109,7 +141,7 @@ function captureConstraints(quality: typeof appliedQuality, followOrientation: b
   const fps = Number(quality.fps)
   return {
     width: { max: size },
-    height: { max: followOrientation ? size : 2 * Math.round(size * 625 / 1920) },
+    height: { max: followOrientation ? size : 2 * Math.round(size / (2 * matePadAspectRatio)) },
     frameRate: { ideal: fps, max: fps },
   }
 }
@@ -131,7 +163,9 @@ function fillSelect(select: HTMLSelectElement, options: ReadonlyArray<[string, s
 function renderSources() {
   const candidates = extension.checked ? [automaticSource, ...sources.filter(({ role }) => role === 'extension')] : sources
   fillSelect(source, candidates.map(({ name, id }) => [id, name]), extension.checked ? '未检测到扩展屏' : '未找到可共享的屏幕')
-  sourceChoice = selectCaptureSource(candidates, sourceChoice)
+  const mode = extension.checked ? 'extension' : 'screen'
+  sourceChoice = selectCaptureSource(candidates, sourcePreference, mode, automaticAvailable)
+  if (sourcePreference !== undefined) sourcePreference = sourceChoice ?? null
   if (sourceChoice) source.value = sourceChoice.id
   else if (candidates.length) {
     source.add(new Option('请选择要共享的屏幕', ''), 0)
@@ -173,9 +207,12 @@ async function loadDevices(updateStatus = true) {
   busy = true
   updateControls()
   try {
-    const [availableSources, availableNetworks] = await Promise.all([api.sources(), api.networks()])
+    const [availableSources, availableNetworks, standbyAvailable] = await Promise.all([
+      api.sources(), api.networks(), api.automaticDisplayAvailable(),
+    ])
     sources = availableSources
     networks = availableNetworks
+    automaticAvailable = standbyAvailable
     renderNetworks()
     renderSources()
     if (updateStatus) showReadiness()
@@ -193,16 +230,26 @@ function resetPointer() {
   if (peer) api.remotePointer('{"action":"cancel"}')
 }
 
+function resetSenderFps() {
+  senderFrameSample = undefined
+  senderFps.textContent = ''
+  senderFps.hidden = true
+}
+
 function closePeer() {
   resetPointer()
+  resetSenderFps()
   dragMotion = undefined
   peer?.pc.close()
   peer = undefined
+  window.clearTimeout(nativePeer?.playbackTimer)
+  nativePeer = undefined
 }
 
 function stopCapture() {
-  stream?.getTracks().forEach((track) => track.stop())
+  const previous = stream
   stream = undefined
+  previous?.getTracks().forEach((track) => track.stop())
 }
 
 async function captureScreen(followOrientation: boolean) {
@@ -219,11 +266,12 @@ async function captureScreen(followOrientation: boolean) {
   return media
 }
 
-function captureApprovedDisplay(id: string, followOrientation: boolean) {
+function captureApprovedDisplay(id: string, followOrientation: boolean, automatic: boolean) {
   return new Promise<MediaStream>((resolve, rejectCapture) => {
     const capture = () => { void captureScreen(followOrientation).then(resolve, rejectCapture) }
     window.addEventListener(AUTOMATIC_CAPTURE_EVENT, capture, { once: true })
-    void api.captureAutomaticDisplay(id).catch((error: unknown) => {
+    const prepare = automatic ? api.captureAutomaticDisplay : api.captureCurrentDisplay
+    void prepare(id).catch((error: unknown) => {
       window.removeEventListener(AUTOMATIC_CAPTURE_EVENT, capture)
       rejectCapture(error)
     })
@@ -271,9 +319,11 @@ async function usesUsbAddress(pc: RTCPeerConnection, address: string) {
 
 function attachSignaling(
   channel: WebSocket, allowTouch: boolean, automatic: boolean, followOrientation: boolean,
-  codec?: 'video/VP8' | 'video/H264', usbAddress?: string,
+  nativeQuality: { sizeCap: number; fpsCap: number } | undefined, codec?: 'video/VP8' | 'video/H264', usbAddress?: string,
 ) {
   let queue = Promise.resolve()
+  let nativeEnabled = !!nativeQuality
+  let nativeFallback = false
   const fail = (id: string, message = '视频连接失败，请让平板重新请求。') => {
     closePeer()
     if (automatic) stopCapture()
@@ -298,16 +348,50 @@ function attachSignaling(
         request.hidden = true
         if (status.dataset.state !== 'error') setStatus('等待平板连接', 'pending')
       } else if (message.type === 'approved') {
-        if (automatic) {
-          setStatus('正在创建虚拟副屏…', 'pending')
-          const media = await captureApprovedDisplay(message.id, followOrientation)
+        let automaticPrepared = false
+        transmit(channel, { type: 'stream-hud', id: message.id, visible: showStreamHud.checked })
+        if (nativeEnabled && nativeQuality) {
+          setStatus('正在检测原生采集和 GPU 硬编码…', 'pending')
+          try {
+            if (automatic) {
+              await api.captureAutomaticDisplay(message.id, true)
+              automaticPrepared = true
+            }
+            const { description, mode } = await api.createNativeOffer(message.id, nativeQuality.sizeCap, nativeQuality.fpsCap)
+            if (socket !== channel || requestId !== message.id) return
+            nativePeer = {
+              id: message.id, mode, streaming: false,
+              playbackTimer: window.setTimeout(() => {
+                if (nativePeer?.id === message.id) nativePeer.recover()
+              }, 12000),
+              recover() {
+                if (!nativeEnabled || socket !== channel || nativePeer?.id !== message.id) return
+                window.clearTimeout(nativePeer.playbackTimer)
+                nativeEnabled = false
+                nativeFallback = true
+                setStatus('原生串流中断，正在切回普通模式…', 'pending')
+                void api.reconnectNativeViewer(message.id).catch(() => fail(message.id))
+              },
+            }
+            transmit(channel, { type: 'offer', id: message.id, description })
+            return
+          } catch {
+            if (socket !== channel || requestId !== message.id) return
+            nativeEnabled = false
+            nativeFallback = true
+            setStatus('原生采集不可用，正在启动普通串流…', 'pending')
+          }
+        }
+        if (automatic || !stream) {
+          if (!nativeFallback) setStatus(automatic ? '正在创建虚拟副屏…' : '正在恢复副屏采集…', 'pending')
+          const media = await captureApprovedDisplay(message.id, followOrientation, automatic && !automaticPrepared)
           if (socket !== channel) {
             media.getTracks().forEach((track) => track.stop())
             return
           }
           stream = media
           media.getVideoTracks()[0].addEventListener('ended', () => {
-            if (socket === channel && stream === media) fail(message.id, '虚拟副屏已断开，请让平板重新请求。')
+            if (socket === channel && stream === media) fail(message.id, '副屏已断开，请让平板重新请求。')
           }, { once: true })
         }
         const media = stream
@@ -332,9 +416,10 @@ function attachSignaling(
               }
             }
             void dragMotion?.enable()
-            setStatus('正在向平板传输画面', 'active')
+            setStatus(nativeFallback ? '正在向平板传输画面（已回退到普通模式）' : '正在向平板传输画面', 'active')
           }
           if (active.pc.connectionState === 'disconnected') {
+            resetSenderFps()
             if (allowTouch) resetPointer()
             setStatus('连接暂时中断，等待恢复', 'pending')
           }
@@ -358,6 +443,11 @@ function attachSignaling(
           }
         }
         await active.publish('offer')
+      } else if (nativePeer?.id === message.id) {
+        if (message.type === 'playback-ready') window.clearTimeout(nativePeer.playbackTimer)
+        else if (message.type === 'answer' || message.type === 'ice') {
+          await api.acceptNativeSignal(message).catch(nativePeer.recover)
+        }
       } else await peer?.accept(message)
     }).catch((error: unknown) => {
       if (socket === channel && requestId) fail(requestId, automatic ? errorMessage(error, '无法创建虚拟副屏。') : undefined)
@@ -368,6 +458,70 @@ function attachSignaling(
   })
 }
 
+api.onNativeStreamState((id, state) => {
+  const active = nativePeer
+  if (!active || active.id !== id) return
+  if (state === 'failed') active.recover()
+  if (state === 'disconnected') {
+    active.streaming = false
+    active.frameSample = undefined
+    resetSenderFps()
+    setStatus('原生连接暂时中断，等待恢复', 'pending')
+  }
+  if (state === 'streaming') {
+    active.streaming = true
+    stopCapture()
+    const { width, height, fps } = active.mode
+    const mode = width === 1920 && height === 1080 ? `1080p${fps}` : `${width}×${height} · ${fps} FPS`
+    setStatus(`正在向平板传输原生画面（目标 ${mode}）`, 'active')
+  }
+})
+
+window.setInterval(async () => {
+  const native = nativePeer
+  if (native?.streaming) {
+    const frames = await api.nativeEncodedFrames(native.id).catch(() => undefined)
+    if (native !== nativePeer || !native.streaming || frames === undefined) return
+    const time = performance.now()
+    const previous = native.frameSample
+    native.frameSample = { time, frames }
+    if (previous && time > previous.time && frames >= previous.frames) {
+      senderFps.textContent = `硬编 ${Math.round((frames - previous.frames) * 1000 / (time - previous.time))} FPS`
+      senderFps.hidden = false
+    }
+    return
+  }
+  const active = peer
+  if (active?.pc.connectionState !== 'connected') return
+  const sender = active.pc.getSenders().find(({ track }) => track?.kind === 'video')
+  const report = await sender?.getStats().catch(() => undefined)
+  if (peer !== active || active.pc.connectionState !== 'connected') return
+  const outbound = report && [...report.values()].find((entry) => entry.type === 'outbound-rtp' && entry.kind === 'video')
+  const source = outbound && report?.get(outbound.mediaSourceId)
+  if (!outbound || !source || !Number.isFinite(outbound.timestamp) ||
+      !Number.isFinite(source.frames) || !Number.isFinite(outbound.framesSent)) {
+    resetSenderFps()
+    return
+  }
+  const current: SenderFrameSample = {
+    id: outbound.id, sourceId: source.id, time: outbound.timestamp, captured: source.frames, sent: outbound.framesSent,
+  }
+  const previous = senderFrameSample
+  if (previous && current.time <= previous.time) return
+  if (!previous || previous.id !== current.id || previous.sourceId !== current.sourceId ||
+      current.captured < previous.captured || current.sent < previous.sent) {
+    resetSenderFps()
+    senderFrameSample = current
+    return
+  }
+  senderFrameSample = current
+  const seconds = (current.time - previous.time) / 1000
+  const captured = Math.round((current.captured - previous.captured) / seconds)
+  const sent = Math.round((current.sent - previous.sent) / seconds)
+  senderFps.textContent = `采集 ${captured} FPS · 发送 ${sent} FPS`
+  senderFps.hidden = false
+}, 1000)
+
 async function beginShare() {
   const selected = sourceChoice
   if (!selected) return
@@ -377,6 +531,10 @@ async function beginShare() {
   const rotatable = extension.checked && selected.canRotate
   const followOrientation = rotatable && orientation.checked
   const mode = connectionMode.value as ConnectionMode
+  const sizeCap = Number(appliedQuality.size)
+  const fpsCap = Number(appliedQuality.fps)
+  const useNative = !nativeSettings.hidden && nativeMode.checked && extension.checked && mode === 'lan' && !followOrientation &&
+    sizeCap >= 1920 && fpsCap >= 60
   const address = network.value
   const adapter = networks.find((item) => item.address === address && item.mode === mode)
   busy = true
@@ -386,6 +544,8 @@ async function beginShare() {
     if (!automatic) {
       await api.selectSource(selected.id, selected.displayId, extension.checked ? 'extension' : 'screen')
       if (captureRun !== run) return
+    }
+    if (!automatic && !useNative) {
       const media = await captureScreen(followOrientation)
       if (captureRun !== run) {
         media.getTracks().forEach((track) => track.stop())
@@ -393,11 +553,11 @@ async function beginShare() {
       }
       stream = media
       media.getVideoTracks()[0].addEventListener('ended', () => {
-        if (captureRun === run) void endShare('所选屏幕已停止捕获。', 'error')
+        if (captureRun === run && stream === media) void endShare('所选屏幕已停止捕获。', 'error')
       }, { once: true })
     }
     captureFollowsOrientation = followOrientation
-    const share = await api.start(address, allowTouch, followOrientation, mode, automatic)
+    const share = await api.start(address, allowTouch, followOrientation, mode, automatic, useNative)
     if (captureRun !== run) return
     const channel = new WebSocket(share.hostUrl)
     socket = channel
@@ -409,7 +569,8 @@ async function beginShare() {
     if (captureRun !== run) return
     // VP8 resumes faster when Windows changes the capture dimensions during a rotation.
     const codec = rotatable ? (followOrientation ? 'video/VP8' : 'video/H264') : undefined
-    attachSignaling(channel, allowTouch, automatic, followOrientation, codec, mode === 'usb' ? address : undefined)
+    attachSignaling(channel, allowTouch, automatic, followOrientation,
+      useNative ? { sizeCap, fpsCap } : undefined, codec, mode === 'usb' ? address : undefined)
     url.value = share.viewerUrl
     qr.src = share.qr
     instructions.hidden = true
@@ -434,6 +595,7 @@ async function beginShare() {
 
 source.addEventListener('change', () => {
   sourceChoice = source.value === AUTOMATIC_DISPLAY ? automaticSource : sources.find(({ id }) => id === source.value) ?? null
+  sourcePreference = sourceChoice
   positionStatus.textContent = ''
   updatePreview()
   showReadiness()
@@ -449,7 +611,7 @@ connectionMode.addEventListener('change', () => {
   updateControls()
 })
 modes.addEventListener('change', () => {
-  sourceChoice = undefined
+  sourcePreference = undefined
   positionStatus.textContent = ''
   renderSources()
   showReadiness()
@@ -457,6 +619,9 @@ modes.addEventListener('change', () => {
 })
 displaySettings.addEventListener('click', () => {
   void api.openDisplaySettings().catch(() => setStatus('请从 Windows 设置打开显示设置。', 'error'))
+})
+vddDriver.addEventListener('click', () => {
+  void api.openVddDriver().catch(() => setStatus('无法打开 VDD 驱动下载页。', 'error'))
 })
 for (const field of [referenceScreen, displaySide]) {
   field.addEventListener('change', () => { positionStatus.textContent = '' })
@@ -494,6 +659,17 @@ for (const field of [captureSize, captureFps]) {
     updateControls()
   })
 }
+nativeMode.addEventListener('change', () => localStorage.setItem(nativeCaptureKey, String(nativeMode.checked)))
+function showFfmpegConfigured(configured: boolean | null) {
+  nativeSettings.hidden = configured === null
+  ffmpegStatus.textContent = configured ? '已配置 FFmpeg' : '尚未配置 FFmpeg'
+}
+void api.nativeFfmpegConfigured().then(showFfmpegConfigured).catch(() => showFfmpegConfigured(null))
+chooseFfmpeg.addEventListener('click', () => {
+  void api.chooseNativeFfmpeg().then(showFfmpegConfigured).catch((error: unknown) => {
+    ffmpegStatus.textContent = errorMessage(error, '选择 FFmpeg 失败。')
+  })
+})
 applyQuality.addEventListener('click', async () => {
   if (applyQuality.disabled) return
   const next = { size: captureSize.value, fps: captureFps.value }
@@ -555,6 +731,11 @@ document.querySelector('#open-project')!.addEventListener('click', () => {
 refresh.addEventListener('click', () => void loadDevices())
 start.addEventListener('click', () => void beginShare())
 stop.addEventListener('click', () => void endShare('已停止共享'))
+showStreamHud.addEventListener('change', () => {
+  localStorage.setItem(streamHudKey, String(showStreamHud.checked))
+  const id = (nativePeer ?? peer)?.id
+  if (socket && id) transmit(socket, { type: 'stream-hud', id, visible: showStreamHud.checked })
+})
 approve.addEventListener('click', () => {
   if (!socket || !requestId) return
   request.hidden = true
@@ -577,6 +758,7 @@ api.onCaptureLost(() => {
     return
   }
   sourceChoice = null
+  sourcePreference = null
   topologyChanged = true
   void endShare('所选屏幕已断开或退出扩展模式。', 'error')
 })
@@ -604,7 +786,7 @@ async function startup() {
       const adapter = restoreNetwork(saved, networks)
       if (display && adapter) {
         modes.querySelector<HTMLInputElement>(`input[value="${saved.extension ? 'extension' : 'screen'}"]`)!.checked = true
-        sourceChoice = display
+        sourcePreference = display
         connectionMode.value = saved.mode
         renderSources()
         renderNetworks()

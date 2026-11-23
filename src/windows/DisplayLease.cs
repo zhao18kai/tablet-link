@@ -8,7 +8,7 @@ using System.Threading;
 internal static class DisplayLease
 {
     private const uint AllPaths = 1, ActivePaths = 2, PathActive = 1;
-    private const uint SuppliedConfig = 0x20, Validate = 0x40, Apply = 0x80;
+    private const uint SuppliedConfig = 0x20, Validate = 0x40, Apply = 0x80, SaveToDatabase = 0x200;
     private const uint InvalidMode = uint.MaxValue;
     private const uint SourceMode = 1, TargetName = 2, PreferredMode = 3;
     private const int InsufficientBuffer = 122;
@@ -150,6 +150,11 @@ internal static class DisplayLease
         return DisplayConfigGetDeviceInfo(ref info) == 0 ? info.DevicePath ?? "" : "";
     }
 
+    private static bool IsVdd(string identity)
+    {
+        return identity.IndexOf("#MTT1337#", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     private static string FindStandby(Path[] paths, out Path standby)
     {
         var active = paths.Where(path => (path.Flags & PathActive) != 0).ToArray();
@@ -158,7 +163,7 @@ internal static class DisplayLease
             if (path.Target.Available == 0 || active.Any(item => SameTarget(item.Target, path.Target) ||
                     SameSource(item.Source, path.Source))) continue;
             string identity = MonitorPath(path.Target);
-            if (identity.IndexOf("#MTT1337#", StringComparison.OrdinalIgnoreCase) < 0) continue;
+            if (!IsVdd(identity)) continue;
             standby = path;
             return identity;
         }
@@ -166,7 +171,7 @@ internal static class DisplayLease
         return "";
     }
 
-    private static bool Commit(Path[] paths, Mode[] modes, Path[] before, Mode[] beforeModes)
+    private static bool Commit(Path[] paths, Mode[] modes, Path[] before, Mode[] beforeModes, bool persist = false)
     {
         uint count = (uint)paths.Length, modeCount = (uint)modes.Length;
         if (SetDisplayConfig(count, paths, modeCount, modes, SuppliedConfig | Validate) != 0) return false;
@@ -185,7 +190,9 @@ internal static class DisplayLease
             }
             else if (!a.Equals(b)) return false;
         }
-        return SetDisplayConfig(count, paths, modeCount, modes, SuppliedConfig | Apply) == 0;
+        uint flags = SuppliedConfig | Apply;
+        if (persist) flags |= SaveToDatabase;
+        return SetDisplayConfig(count, paths, modeCount, modes, flags) == 0;
     }
 
     private static bool Attach(Path standby, Path[] active, Mode[] modes)
@@ -255,7 +262,7 @@ internal static class DisplayLease
         return count == sources.Length;
     }
 
-    private static bool Detach(Target target, string identity)
+    private static bool Detach(Target target, string identity, bool prepareStandby = false)
     {
         // Build the removal from the current topology so unrelated changes made during sharing are preserved.
         Path[] paths;
@@ -264,10 +271,12 @@ internal static class DisplayLease
         int index = Array.FindIndex(paths, path => SameTarget(path.Target, target));
         if (index < 0) return true;
         if (!string.Equals(identity, MonitorPath(paths[index].Target), StringComparison.OrdinalIgnoreCase)) return false;
-        var source = modes[paths[index].Source.Mode];
-        if (source.X == 0 && source.Y == 0) return false; // The user made this display primary.
-
         var remaining = paths.Where((_, position) => position != index).ToArray();
+        var source = modes[paths[index].Source.Mode];
+        // A freshly installed VDD can mirror the primary display. Leave the primary desktop in place.
+        if (source.X == 0 && source.Y == 0 && (!prepareStandby || !remaining.Any(path =>
+                modes[path.Source.Mode].X == 0 && modes[path.Source.Mode].Y == 0 && !IsVdd(MonitorPath(path.Target))))) return false;
+
         // Windows would close a gap by moving unrelated displays. Keep the owned path if it is now a bridge.
         if (remaining.Length == 0 || !IsConnected(remaining.Select(path => modes[path.Source.Mode]).ToArray())) return false;
         var kept = new List<Mode>();
@@ -277,7 +286,21 @@ internal static class DisplayLease
             remaining[i].Source.Mode = KeepMode(remaining[i].Source.Mode, modes, kept, remapped);
             remaining[i].Target.Mode = KeepMode(remaining[i].Target.Mode, modes, kept, remapped);
         }
-        return Commit(remaining, kept.ToArray(), paths, modes);
+        return Commit(remaining, kept.ToArray(), paths, modes, prepareStandby);
+    }
+
+    public static int PrepareStandby()
+    {
+        int probe = Run(true);
+        if (probe != 10) return probe;
+        Path[] paths;
+        Mode[] modes;
+        if (!ReadPaths(ActivePaths, out paths, out modes)) return 11;
+        var displays = paths.Select(path => new { path.Target, Identity = MonitorPath(path.Target) })
+            .Where(display => IsVdd(display.Identity)).ToArray();
+        if (displays.Length != 1 || paths.Length < 2) return 10;
+        var displayToDetach = displays[0];
+        return Detach(displayToDetach.Target, displayToDetach.Identity, true) ? Run(true) : 12;
     }
 
     public static int Run(bool probe)
@@ -287,7 +310,12 @@ internal static class DisplayLease
         if (!ReadPaths(AllPaths, out paths, out modes)) return 11;
         Path standby;
         string identity = FindStandby(paths, out standby);
-        if (identity.Length == 0) return 10;
+        if (identity.Length == 0)
+        {
+            bool hasVdd = paths.Any(path => (path.Target.Available != 0 || (path.Flags & PathActive) != 0) &&
+                IsVdd(MonitorPath(path.Target)));
+            return hasVdd ? 10 : 13;
+        }
         if (probe) return 0;
         if (!ReadPaths(ActivePaths, out paths, out modes) ||
             !string.Equals(identity, MonitorPath(standby.Target), StringComparison.OrdinalIgnoreCase) ||

@@ -7,6 +7,28 @@ export interface WindowsDisplaySession {
   close(): Promise<void>
 }
 
+function displayError(code: number | null) {
+  switch (code) {
+    case 10:
+      return new Error('没有可用的备用虚拟屏。请在 Windows 显示设置中断开一块 VDD by MTT 虚拟屏，或选择现有屏幕。')
+    case 13:
+      return new Error('未检测到 VDD by MTT 虚拟屏。请安装或启用 VDD 驱动并添加虚拟屏，或选择现有屏幕。')
+    default:
+      return new Error('Windows 无法准备自动副屏。请确认虚拟显示驱动已启用并重试。')
+  }
+}
+
+export function checkWindowsDisplay(executable: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const probe = spawn(executable, ['--probe-display'], { windowsHide: true, stdio: 'ignore', timeout: 5000 })
+    probe.once('error', () => reject(displayError(null)))
+    probe.once('close', (code) => {
+      if (code === 0) resolve()
+      else reject(displayError(code))
+    })
+  })
+}
+
 export async function openWindowsDisplay(executable: string): Promise<WindowsDisplaySession> {
   const helper = spawn(executable, ['--lease-display'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
   const output = createInterface({ input: helper.stdout })
@@ -28,9 +50,7 @@ export async function openWindowsDisplay(executable: string): Promise<WindowsDis
   const exited = new Promise<number | null>((resolve) => {
     helper.once('close', (code) => {
       output.close()
-      rejectReady(new Error(code === 10
-        ? '没有可用的备用虚拟屏。请在 Windows 显示设置中断开一块 VDD by MTT 虚拟屏，或选择现有屏幕。'
-        : 'Windows 无法创建自动副屏。请确认虚拟显示驱动已启用并重试。'))
+      rejectReady(displayError(code))
       resolve(code)
     })
   })

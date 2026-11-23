@@ -1,4 +1,5 @@
 type Point = { x: number; y: number }
+export type VideoFit = 'contain' | 'cover' | 'fill'
 
 export const maxPointerWheelDelta = 480
 
@@ -27,15 +28,15 @@ export function videoPointerPosition(
   rect: { left: number; top: number; width: number; height: number },
   sourceWidth: number,
   sourceHeight: number,
-  cover: boolean,
+  fit: VideoFit,
   clientX: number,
   clientY: number,
   clamp = false,
 ): Point | undefined {
   if (!rect.width || !rect.height || !sourceWidth || !sourceHeight) return
-  const scale = (cover ? Math.max : Math.min)(rect.width / sourceWidth, rect.height / sourceHeight)
-  const width = sourceWidth * scale
-  const height = sourceHeight * scale
+  const scale = (fit === 'cover' ? Math.max : Math.min)(rect.width / sourceWidth, rect.height / sourceHeight)
+  const width = fit === 'fill' ? rect.width : sourceWidth * scale
+  const height = fit === 'fill' ? rect.height : sourceHeight * scale
   const x = (clientX - rect.left - (rect.width - width) / 2) / width
   const y = (clientY - rect.top - (rect.height - height) / 2) / height
   if (clamp) return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) }

@@ -1,7 +1,7 @@
 {
   "name": "tablet-link",
   "productName": "Tablet Link",
-  "version": "0.5.0",
+  "version": "0.5.8",
   "private": true,
   "description": "Stream a Windows display to a tablet on the local network.",
   "license": "MIT",
@@ -12,7 +12,8 @@
     "check": "tsc --noEmit",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/*.test.ts",
     "test:e2e": "npm run build && node --test test/stream.e2e.mjs",
-    "package:win": "npm run build && node scripts/package-win.mjs"
+    "package:win": "npm run build && node scripts/package-win.mjs",
+    "package:installer": "npm run build && node scripts/package-installer.mjs"
   },
   "engines": {
     "node": ">=24"
@@ -20,6 +21,7 @@
   "dependencies": {
     "@homebridge/ciao": "1.4.0",
     "qrcode-generator": "2.0.4",
+    "werift": "0.28.0",
     "ws": "8.23.0"
   },
   "devDependencies": {

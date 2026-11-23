@@ -1,4 +1,4 @@
-import { maxPointerWheelDelta, videoPointerPosition, type PointerCommand } from './pointer.ts'
+import { maxPointerWheelDelta, videoPointerPosition, type PointerCommand, type VideoFit } from './pointer.ts'
 
 const tapSlop = 8
 const pixelsPerWheelNotch = 24
@@ -16,6 +16,7 @@ export function createViewerPointer(
   video: HTMLVideoElement,
   send: (command: PointerCommand) => void,
   toggleMenu: () => void,
+  getVideoFit: () => VideoFit,
 ) {
   let enabled = false
   const fingers = new Map<number, { initial: PointerEvent; last: ClientPoint }>()
@@ -26,7 +27,7 @@ export function createViewerPointer(
 
   function position(point: ClientPoint, clamp = false) {
     return videoPointerPosition(video.getBoundingClientRect(), video.videoWidth, video.videoHeight,
-      video.classList.contains('video-cover'), point.clientX, point.clientY, clamp)
+      getVideoFit(), point.clientX, point.clientY, clamp)
   }
 
   function clearWheel() {

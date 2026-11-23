@@ -41,7 +41,10 @@
         </fieldset>
         <div id="display-hint" class="display-hint" hidden>
           <p>自动副屏需要一块未接入桌面的 VDD by MTT 虚拟屏。也可选择已启用的扩展屏。</p>
-          <button class="quiet" id="display-settings" type="button">打开 Windows 显示设置</button>
+          <div class="display-hint-actions">
+            <button class="quiet" id="vdd-driver" type="button">获取 VDD 驱动</button>
+            <button class="quiet" id="display-settings" type="button">打开 Windows 显示设置</button>
+          </div>
         </div>
         <label for="source">共享屏幕</label>
         <select id="source" disabled></select>
@@ -56,8 +59,10 @@
         <label for="network">电脑网络地址</label>
         <select id="network" disabled></select>
         <p class="field-note" id="usb-hint" hidden>接上 USB 数据线，在平板上开启「USB 共享网络」，再点「刷新设备」。</p>
-        <label class="touch-option" id="touch-option" hidden><input type="checkbox" id="allow-touch">允许平板触控</label>
+        <label class="touch-option" id="touch-option" hidden><input type="checkbox" id="allow-touch" checked>允许平板触控</label>
         <label class="touch-option" id="orientation-option" hidden><input type="checkbox" id="follow-orientation" checked>跟随平板横竖屏</label>
+        <label class="touch-option"><input type="checkbox" id="show-stream-hud" aria-describedby="stream-hud-note" checked>显示副屏悬浮窗</label>
+        <p class="field-note" id="stream-hud-note">在平板调出控件时显示帧率、码率和连接状态。</p>
       </section>
 
       <div class="connection-panels">
@@ -112,6 +117,7 @@
       <select id="capture-size">
         <option value="1280">1280 像素</option>
         <option value="1920" selected>1920 像素</option>
+        <option value="2456">2456 像素（MatePad 11.5 2026 长边）</option>
         <option value="2560">2560 像素</option>
       </select>
       <p class="field-note">按长边计算。实际分辨率取决于 Windows 显示模式和连接状况。</p>
@@ -119,8 +125,17 @@
       <select id="capture-fps">
         <option value="30">30 FPS</option>
         <option value="45">45 FPS</option>
-        <option value="60" selected>60 FPS</option>
+        <option value="60">60 FPS</option>
+        <option value="120" selected>120 FPS</option>
       </select>
+      <p class="field-note">持续拖动窗口或滚动页面时，可在平板悬浮窗对比接收、解码和呈现帧率。</p>
+      <p class="field-note" id="host-stream-fps" hidden></p>
+      <div id="native-settings" hidden>
+        <label class="touch-option"><input type="checkbox" id="native-capture">原生高帧率</label>
+        <p class="field-note">支持 1920 × 1080 至 2560 × 1600 的局域网横屏副屏。帧率上限取决于画质设置和副屏刷新率。关闭跟随横竖屏，分辨率上限需覆盖副屏长边。启动失败时自动使用普通串流。</p>
+        <button class="quiet" id="choose-native-ffmpeg" type="button">选择 FFmpeg</button>
+        <span class="field-note" id="native-ffmpeg-status" role="status"></span>
+      </div>
       <button class="primary actions" id="apply-quality" type="button" disabled>应用</button>
       <p class="field-note" id="quality-status" role="status"></p>
     </section>

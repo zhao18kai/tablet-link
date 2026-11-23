@@ -163,9 +163,14 @@ internal static class TabletPointer
         SetThreadDpiAwarenessContext(new IntPtr(-4)); // Per-monitor DPI aware v2
         if (args.Length != 0)
         {
-            Environment.ExitCode = args[0] == "--lease-display" || args[0] == "--probe-display"
-                ? DisplayLease.Run(args[0] == "--probe-display")
-                : VirtualDisplay.Change(args);
+            switch (args[0])
+            {
+                case "--lease-display": Environment.ExitCode = DisplayLease.Run(false); break;
+                case "--probe-display": Environment.ExitCode = DisplayLease.Run(true); break;
+                case "--prepare-vdd-standby": Environment.ExitCode = DisplayLease.PrepareStandby(); break;
+                case "--dxgi-output": Environment.ExitCode = VirtualDisplay.FindDxgiOutput(args); break;
+                default: Environment.ExitCode = VirtualDisplay.Change(args); break;
+            }
             return;
         }
         using (var watchdog = new Timer(_ =>

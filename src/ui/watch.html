@@ -13,7 +13,16 @@
       <h1>平板智联</h1>
       <div class="viewer-actions">
         <span id="touch-hint" hidden>双指滑动滚动，双指轻触显示全屏控件</span>
-        <button class="quiet" id="fit" type="button" aria-pressed="false" hidden>铺满画面（裁边）</button>
+        <select class="quiet" id="fit" aria-label="画面显示方式" hidden>
+          <option value="fill">拉伸铺满（保留四边）</option>
+          <option value="contain" selected>等比完整（可能留边）</option>
+          <option value="cover">等比铺满（裁边）</option>
+        </select>
+        <select class="quiet" id="receiver-buffer" aria-label="视频缓冲" hidden>
+          <option value="0" selected>缓冲 0 ms</option>
+          <option value="auto">自动缓冲</option>
+          <option value="20">缓冲 20 ms</option>
+        </select>
         <button class="quiet" id="fullscreen" type="button" disabled>全屏</button>
         <button class="quiet" id="leave" type="button" disabled>断开</button>
       </div>
@@ -30,14 +39,17 @@
             <span class="stream-tag" id="stream-codec" hidden></span>
           </div>
           <div class="stream-readings">
-            <span id="stream-fps">— FPS</span>
+            <span class="stream-reading"><span>接收</span><span id="stream-received-fps">— FPS</span></span>
+            <span class="stream-reading"><span>解码</span><span id="stream-fps">— FPS</span></span>
+            <span class="stream-reading"><span>呈现</span><span id="stream-presented-fps">— FPS</span></span>
             <span class="stream-reading"><span>码率</span><span id="stream-bitrate">— Mb/s</span></span>
             <span class="stream-reading"><span>往返</span><span id="stream-rtt">— ms</span></span>
+            <span class="stream-reading"><span>缓冲</span><span id="stream-buffer-delay">— ms</span></span>
             <span id="stream-resolution">— × —</span>
           </div>
         </div>
         <div class="stream-trend">
-          <span>近 30 秒帧率</span>
+          <span>近 30 秒呈现帧率</span>
           <canvas id="stream-history" aria-hidden="true"></canvas>
         </div>
       </div>

@@ -12,6 +12,8 @@ export type MediaSignal =
 
 export type DisplayOrientation = 'landscape' | 'portrait'
 export type ConnectionMode = 'lan' | 'usb'
+export type NativeStreamState = 'streaming' | 'disconnected' | 'failed'
+export type NativeVideoMode = { width: number; height: number; fps: number }
 export type RememberedComputer = { id: string; name: string; token: string }
 
 export type Signal = (
@@ -19,7 +21,8 @@ export type Signal = (
   | { type: 'viewer-request'; resumed?: boolean }
   | { type: 'approved'; resumeToken?: string; followOrientation?: true; connectionMode?: ConnectionMode; rememberedComputer?: RememberedComputer }
   | { type: 'orientation'; direction: DisplayOrientation }
-  | { type: 'viewer-left' | 'approve' | 'reject' | 'rejected' }
+  | { type: 'stream-hud'; visible: boolean }
+  | { type: 'viewer-left' | 'approve' | 'reject' | 'rejected' | 'playback-ready' }
 ) & { id: string }
 
 export interface CaptureSource {
@@ -47,14 +50,26 @@ export interface ShareInfo {
 
 export interface TabletLink {
   sources(): Promise<CaptureSource[]>
+  automaticDisplayAvailable(): Promise<boolean>
   networks(): Promise<NetworkAddress[]>
   selectSource(id: string, displayId: string, mode: CaptureMode): Promise<void>
-  start(address: string, allowTouch: boolean, followOrientation: boolean, mode: ConnectionMode, automatic?: boolean): Promise<ShareInfo>
-  captureAutomaticDisplay(viewer: string): Promise<void>
+  start(address: string, allowTouch: boolean, followOrientation: boolean, mode: ConnectionMode, automatic?: boolean, native?: boolean): Promise<ShareInfo>
+  captureAutomaticDisplay(viewer: string, prepareOnly?: boolean): Promise<void>
+  captureCurrentDisplay(viewer: string): Promise<void>
+  nativeFfmpegConfigured(): Promise<boolean | null>
+  chooseNativeFfmpeg(): Promise<boolean>
+  createNativeOffer(viewer: string, sizeCap: number, fpsCap: number): Promise<{
+    description: RTCSessionDescriptionInit
+    mode: NativeVideoMode
+  }>
+  acceptNativeSignal(message: MediaSignal & { id: string }): Promise<void>
+  reconnectNativeViewer(viewer: string): Promise<void>
+  nativeEncodedFrames(viewer: string): Promise<number | undefined>
   stop(): Promise<void>
   remotePointer(command: string): void
   copy(text: string): Promise<void>
   openDisplaySettings(): Promise<void>
+  openVddDriver(): Promise<void>
   placeDisplay(displayId: string, referenceId: string, side: DisplaySide): Promise<void>
   getVersion(): Promise<string>
   launchAtLogin(enabled?: boolean): Promise<boolean | null>
@@ -64,4 +79,5 @@ export interface TabletLink {
   onDisplaysChanged(callback: () => void): void
   onCaptureLost(callback: () => void): void
   onDisplayCleanupFailed(callback: () => void): void
+  onNativeStreamState(callback: (viewer: string, state: NativeStreamState) => void): void
 }
